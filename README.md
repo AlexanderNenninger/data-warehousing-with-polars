@@ -246,18 +246,20 @@ def clean(lf: pl.LazyFrame) -> pl.LazyFrame:
 poe qa
 
 # Individual steps
-poe fmt        # ruff format
-poe lint       # ruff check --fix
-poe typecheck  # ty check
-poe test       # pytest -v
+poe fmt          # ruff format
+poe lint         # ruff check --fix
+poe typecheck    # ty check
+poe test         # pytest (excludes memory tests)
+poe test_memory  # memory-boundedness tests (each in a fresh subprocess)
 ```
 
 ## Requirements
 
 - Python >= 3.12
 - polars >= 1.41.0
-- deltalake >= 1.6.0
-- pyarrow >= 24.0.0
+- deltalake >= 0.22.3
+- pyarrow >= 19.0.0
+- pydantic >= 2.0.0
 
 ## License
 
