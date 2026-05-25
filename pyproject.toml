@@ -5,10 +5,11 @@ description = "ACID data warehousing with Polars and Delta Lake"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "polars>=1.41.0",
+    "polars>=1.30.0",
     "deltalake>=0.22.3",
     "pyarrow>=19.0.0",
-    "pydantic>=2.0.0",
+    "pydantic>=2.10.0",
+    "polars-cloud>=0.6.3",
 ]
 [project.urls]
 repository = "https://github.com/AlexanderNenninger/data-warehousing-with-polars"
@@ -46,4 +47,9 @@ lint = "ruff check src tests app --fix --unsafe-fixes"
 typecheck = "ty check src app"
 test = "pytest tests/ --ignore=tests/test_memory.py -v"
 test_memory = "pytest tests/test_memory.py -v"
+test_min_versions.sequence = [
+    { cmd = "uv sync --resolution=lowest-direct" },
+    { cmd = "pytest tests/ --ignore=tests/test_memory.py -v" },
+    { cmd = "uv sync" },
+]
 qa.sequence = ["fmt", "lint", "typecheck", "test", "test_memory"]
