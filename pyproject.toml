@@ -9,8 +9,11 @@ dependencies = [
     "deltalake>=0.22.3",
     "pyarrow>=19.0.0",
     "pydantic>=2.10.0",
-    "polars-cloud>=0.6.3",
 ]
+
+[project.optional-dependencies]
+cloud = ["polars-cloud>=0.6.3"]
+
 [project.urls]
 repository = "https://github.com/AlexanderNenninger/data-warehousing-with-polars"
 
