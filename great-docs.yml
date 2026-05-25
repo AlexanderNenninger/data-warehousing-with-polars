@@ -7,6 +7,11 @@
 # Example: project 'py-yaml12' with module name 'yaml12'
 # module: yaml12
 
+display_name: "Data Warehousing with Polars"
+
+# Site Settings
+# -------------
+
 # Docstring Parser
 # ----------------
 # The docstring format used in your package (numpy, google, or sphinx)

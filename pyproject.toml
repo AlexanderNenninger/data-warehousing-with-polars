@@ -10,6 +10,8 @@ dependencies = [
     "pyarrow>=19.0.0",
     "pydantic>=2.0.0",
 ]
+[project.urls]
+repository = "https://github.com/AlexanderNenninger/data-warehousing-with-polars"
 
 [tool.setuptools.packages.find]
 where = ["src"]
