@@ -125,8 +125,7 @@ def counts_daily(lf: pl.LazyFrame) -> pl.LazyFrame:
         pl.col("datum").str.to_date("%d.%m.%Y", strict=False),
     )
     return (
-        lf
-        .rename({"min-temp": "min_temp", "max-temp": "max_temp"})
+        lf.rename({"min-temp": "min_temp", "max-temp": "max_temp"})
         .with_columns(parsed_datum.alias("datum"))
         .with_columns(pl.col("datum").dt.year().alias("year"))
     )
