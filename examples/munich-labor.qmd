@@ -1,0 +1,163 @@
+---
+title: Munich Labor Market
+---
+
+The [Monatszahlen Arbeitsmarkt](https://opendata.muenchen.de/dataset/monatszahlen-arbeitsmarkt)
+dataset, published monthly by the Statistisches Amt München, tracks
+unemployment figures and open job postings for Munich going back to the 1990s.
+It is one of the most watched economic indicators for the city.
+
+Like the other Monatszahlen sources the portal publishes a single full-history
+CSV that is replaced every month.  The pipeline fetches the current URL via the
+Munich Open Data CKAN API, validates columns with
+[`@schema`](../reference/schema.schema.qmd), and upserts into a Delta Lake
+table using [`@incremental`](../reference/incremental.incremental.qmd).
+
+**Data source:** Statistisches Amt München ·
+License: [Datenlizenz Deutschland – Namensnennung 2.0](https://www.govdata.de/dl-de/by-2-0)
+
+```{python}
+#| echo: false
+import os
+from pathlib import Path
+
+import altair as alt
+import polars as pl
+
+_env = Path("..") / ".env"
+if _env.exists():
+    for _line in _env.read_text().splitlines():
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _, _v = _line.partition("=")
+            os.environ.setdefault(_k.strip(), _v.strip())
+
+BUCKET = os.environ.get("MUNICH_CYCLING_BUCKET", "data-warehousing-with-polars")
+```
+
+```{python}
+#| echo: false
+df = (
+    pl.scan_delta(f"s3://{BUCKET}/delta/munich_labor")
+    .select("MONATSZAHL", "AUSPRAEGUNG", "JAHR", "WERT", "date")
+    .collect()
+    .sort("date")
+)
+df.head(5)
+```
+
+## Monthly unemployment
+
+Total registered unemployed in Munich per month. The series reveals the
+2008–2009 financial crisis, the COVID shock in spring 2020, and the subsequent
+tight labour market.
+
+```{python}
+#| echo: false
+unemployed = (
+    df.filter(
+        (pl.col("MONATSZAHL") == "Arbeitslose")
+        & (pl.col("AUSPRAEGUNG") == "insgesamt")
+    )
+    .drop_nulls("WERT")
+    .sort("date")
+    .with_columns(
+        pl.col("WERT").rolling_mean(window_size=12).alias("rolling_12m")
+    )
+)
+
+base = alt.Chart(unemployed).encode(x=alt.X("date:T", title="Month"))
+
+raw = base.mark_line(opacity=0.25, color="#e45756").encode(
+    y=alt.Y("WERT:Q", title="Unemployed", axis=alt.Axis(format="~s")),
+    tooltip=[
+        alt.Tooltip("date:T", title="Month", format="%b %Y"),
+        alt.Tooltip("WERT:Q", title="Unemployed", format=",.0f"),
+    ],
+)
+smooth = base.mark_line(color="#e45756", strokeWidth=2).encode(
+    y="rolling_12m:Q",
+    tooltip=[
+        alt.Tooltip("date:T", title="Month", format="%b %Y"),
+        alt.Tooltip("rolling_12m:Q", title="12-month avg", format=",.0f"),
+    ],
+)
+
+(raw + smooth).properties(
+    width="container", height=260, title="Total unemployed (Arbeitslose insgesamt)"
+).configure_view(strokeWidth=0)
+```
+
+## Unemployment by gender
+
+Monthly unemployed broken down by gender, showing whether crises hit men and
+women differently.
+
+```{python}
+#| echo: false
+by_gender = (
+    df.filter(
+        (pl.col("MONATSZAHL") == "Arbeitslose")
+        & (pl.col("AUSPRAEGUNG").is_in(["Männer", "Frauen"]))
+    )
+    .drop_nulls("WERT")
+)
+
+color_scale = alt.Scale(
+    domain=["Männer", "Frauen"],
+    range=["#4c78a8", "#e45756"],
+)
+
+selection = alt.selection_point(fields=["AUSPRAEGUNG"], bind="legend")
+
+alt.Chart(by_gender).mark_line(strokeWidth=1.5).encode(
+    x=alt.X("date:T", title="Month"),
+    y=alt.Y("WERT:Q", title="Unemployed", axis=alt.Axis(format="~s")),
+    color=alt.Color(
+        "AUSPRAEGUNG:N",
+        scale=color_scale,
+        legend=alt.Legend(title="Gender"),
+    ),
+    opacity=alt.condition(selection, alt.value(1), alt.value(0.1)),
+    tooltip=[
+        alt.Tooltip("date:T", title="Month", format="%b %Y"),
+        alt.Tooltip("AUSPRAEGUNG:N", title="Gender"),
+        alt.Tooltip("WERT:Q", title="Unemployed", format=",.0f"),
+    ],
+).add_params(selection).properties(
+    width="container", height=260, title="Unemployed by gender"
+).configure_view(strokeWidth=0)
+```
+
+## Seasonality
+
+Average unemployment by calendar month across all available years, showing the
+mild summer trough and winter uptick typical of Munich's labour market.
+
+```{python}
+#| echo: false
+seasons = (
+    unemployed
+    .with_columns(
+        pl.col("date").dt.month().alias("month_num"),
+        pl.col("date").dt.strftime("%b").alias("month_name"),
+    )
+    .group_by("month_num", "month_name")
+    .agg(pl.col("WERT").mean().alias("avg_unemployed"))
+    .sort("month_num")
+)
+
+alt.Chart(seasons).mark_bar(color="#e45756").encode(
+    x=alt.X("month_name:N", sort=None, title="Month"),
+    y=alt.Y(
+        "avg_unemployed:Q",
+        title="Avg unemployed",
+        axis=alt.Axis(format="~s"),
+    ),
+    tooltip=[
+        alt.Tooltip("month_name:N", title="Month"),
+        alt.Tooltip("avg_unemployed:Q", title="Avg unemployed", format=",.0f"),
+    ],
+).properties(
+    width="container", height=220, title="Average unemployment by month of year"
+).configure_view(strokeWidth=0)
+```
