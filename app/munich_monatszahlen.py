@@ -53,6 +53,7 @@ import os
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
 import polars as pl
 from deltalake import write_deltalake
@@ -117,7 +118,7 @@ def _transform(df: pl.DataFrame, source_path: str) -> pl.DataFrame:
     natural keys ensures the Delta table stays clean regardless.
     """
     now = datetime.now(timezone.utc)
-    return (
+    result = (
         df.lazy()
         .filter(pl.col("MONAT") != "Summe")
         .with_columns(
@@ -128,6 +129,7 @@ def _transform(df: pl.DataFrame, source_path: str) -> pl.DataFrame:
         .unique(subset=_NATURAL_KEYS, keep="last", maintain_order=False)
         .collect()
     )
+    return cast(pl.DataFrame, result)
 
 
 # ── Watermark helpers ─────────────────────────────────────────────────────────
@@ -136,9 +138,8 @@ def _transform(df: pl.DataFrame, source_path: str) -> pl.DataFrame:
 def _already_processed(watermark_store: str, stamp: str) -> bool:
     """Return True if *stamp* (YYYYMM) is recorded in the watermark table."""
     try:
-        stamps = (
-            pl.scan_delta(watermark_store).select("stamp").collect()["stamp"].to_list()
-        )
+        collected = cast(pl.DataFrame, pl.scan_delta(watermark_store).select("stamp").collect())
+        stamps = collected["stamp"].to_list()
         return stamp in stamps
     except Exception:
         return False
@@ -146,11 +147,13 @@ def _already_processed(watermark_store: str, stamp: str) -> bool:
 
 def _save_stamp(watermark_store: str, stamp: str, rows: int) -> None:
     """Append *stamp* with metadata to the watermark table."""
-    wm = pl.DataFrame({
-        "stamp": [stamp],
-        "written_at": [datetime.now(timezone.utc)],
-        "rows": [rows],
-    })
+    wm = pl.DataFrame(
+        {
+            "stamp": [stamp],
+            "written_at": [datetime.now(timezone.utc)],
+            "rows": [rows],
+        }
+    )
     write_deltalake(watermark_store, wm.to_arrow(), mode="append")
 
 
@@ -176,7 +179,9 @@ def _ingest(name: str, target: str) -> int:
 
     csv_path = _download(name)
 
-    df_raw = pl.read_csv(str(csv_path), schema_overrides=SCHEMA_MONATSZAHLEN, null_values=["NA"], quote_char='"')
+    df_raw = pl.read_csv(
+        str(csv_path), schema_overrides=SCHEMA_MONATSZAHLEN, null_values=["NA"], quote_char='"'
+    )
     logger.info("[%s] Raw CSV: %d rows.", name, len(df_raw))
 
     df = _transform(df_raw, str(csv_path))
@@ -249,10 +254,10 @@ def _download(name: str) -> Path:
 def main() -> None:
     for name, suffix in [
         ("accidents", "munich_accidents"),
-        ("airport",   "munich_airport"),
-        ("vehicles",  "munich_vehicles"),
-        ("tourism",   "munich_tourism"),
-        ("labor",     "munich_labor"),
+        ("airport", "munich_airport"),
+        ("vehicles", "munich_vehicles"),
+        ("tourism", "munich_tourism"),
+        ("labor", "munich_labor"),
     ]:
         target = f"s3://{BUCKET}/delta/{suffix}"
         n = _ingest(name, target)
@@ -261,5 +266,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

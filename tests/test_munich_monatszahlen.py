@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import sys
-import types
-import urllib.error
-import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -22,11 +19,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "app"))
 
 from munich_monatszahlen import (  # noqa: E402
-    CKAN_API,
-    SCHEMA_MONATSZAHLEN,
     _CKAN_SLUGS,
     _NATURAL_KEYS,
     _URLS,
+    CKAN_API,
+    SCHEMA_MONATSZAHLEN,
     _already_processed,
     _fetch_ckan_url,
     _ingest,
@@ -244,15 +241,17 @@ def test_fetch_ckan_url_returns_first_csv(tmp_path):
     """_fetch_ckan_url must return the URL of the first CSV resource."""
     import json
 
-    payload = json.dumps({
-        "success": True,
-        "result": {
-            "resources": [
-                {"format": "CSV", "url": "https://example.com/tourismus.csv"},
-                {"format": "PDF", "url": "https://example.com/tourismus.pdf"},
-            ]
-        },
-    }).encode()
+    payload = json.dumps(
+        {
+            "success": True,
+            "result": {
+                "resources": [
+                    {"format": "CSV", "url": "https://example.com/tourismus.csv"},
+                    {"format": "PDF", "url": "https://example.com/tourismus.pdf"},
+                ]
+            },
+        }
+    ).encode()
 
     with patch("urllib.request.urlopen", return_value=_mock_urlopen(payload)):
         url = _fetch_ckan_url("monatszahlen-tourismus")
@@ -264,14 +263,16 @@ def test_fetch_ckan_url_case_insensitive_format(tmp_path):
     """Format comparison must be case-insensitive (e.g. 'csv' == 'CSV')."""
     import json
 
-    payload = json.dumps({
-        "success": True,
-        "result": {
-            "resources": [
-                {"format": "csv", "url": "https://example.com/data.csv"},
-            ]
-        },
-    }).encode()
+    payload = json.dumps(
+        {
+            "success": True,
+            "result": {
+                "resources": [
+                    {"format": "csv", "url": "https://example.com/data.csv"},
+                ]
+            },
+        }
+    ).encode()
 
     with patch("urllib.request.urlopen", return_value=_mock_urlopen(payload)):
         url = _fetch_ckan_url("monatszahlen-arbeitsmarkt")
@@ -294,14 +295,16 @@ def test_fetch_ckan_url_raises_when_no_csv():
     """RuntimeError must be raised when no CSV resource is available."""
     import json
 
-    payload = json.dumps({
-        "success": True,
-        "result": {
-            "resources": [
-                {"format": "PDF", "url": "https://example.com/doc.pdf"},
-            ]
-        },
-    }).encode()
+    payload = json.dumps(
+        {
+            "success": True,
+            "result": {
+                "resources": [
+                    {"format": "PDF", "url": "https://example.com/doc.pdf"},
+                ]
+            },
+        }
+    ).encode()
 
     with patch("urllib.request.urlopen", return_value=_mock_urlopen(payload)):
         with pytest.raises(RuntimeError, match="No CSV resource"):

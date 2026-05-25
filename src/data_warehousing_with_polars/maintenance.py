@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from typing import cast
 
 import polars as pl
 from deltalake import DeltaTable, write_deltalake
@@ -48,8 +49,9 @@ def _load_run_count(store: str) -> int:
     """
     runs_store = store.rstrip("/") + _RUNS_SUFFIX
     try:
-        result = pl.scan_delta(runs_store).select(pl.col("run_count").max()).collect()
-        assert isinstance(result, pl.DataFrame)
+        result = cast(
+            pl.DataFrame, pl.scan_delta(runs_store).select(pl.col("run_count").max()).collect()
+        )
         val = result["run_count"][0]
         return int(val) if val is not None else 0
     except Exception:

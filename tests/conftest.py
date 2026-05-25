@@ -126,3 +126,12 @@ def pytest_terminal_summary(
     for nodeid, peak_bytes in sorted(_peak_rss_results, key=lambda x: x[1], reverse=True):
         mb = peak_bytes / (1024 * 1024)
         terminalreporter.write_line(f"  {mb:6.1f} MB  {nodeid}")
+
+
+@pytest.fixture(autouse=True)
+def python_dotenv() -> Generator[None, None, None]:
+    """Load environment variables from .env before tests run."""
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    yield
