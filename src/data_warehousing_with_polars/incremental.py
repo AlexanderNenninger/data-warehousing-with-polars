@@ -56,10 +56,12 @@ def _load_watermark(store: str) -> set[str]:
 
 def _save_watermark(store: str, paths: list[str]) -> None:
     """Append *paths* with an ``ingested_at`` timestamp to the watermark table."""
-    rows = pl.DataFrame({
-        "file_path": paths,
-        "ingested_at": [datetime.now(timezone.utc)] * len(paths),
-    })
+    rows = pl.DataFrame(
+        {
+            "file_path": paths,
+            "ingested_at": [datetime.now(timezone.utc)] * len(paths),
+        }
+    )
     write_deltalake(store, rows, mode="append")
 
 
@@ -76,10 +78,12 @@ def _load_delta_watermark(store: str) -> int | None:
 
 def _save_delta_watermark(store: str, version: int) -> None:
     """Append *version* with a ``committed_at`` timestamp to the watermark table."""
-    rows = pl.DataFrame({
-        "version": [version],
-        "committed_at": [datetime.now(timezone.utc)],
-    })
+    rows = pl.DataFrame(
+        {
+            "version": [version],
+            "committed_at": [datetime.now(timezone.utc)],
+        }
+    )
     write_deltalake(store, rows, mode="append")
 
 
@@ -194,8 +198,7 @@ def _sink_target(
 
     dt = DeltaTable(target)
     (
-        dt
-        .merge(_df.to_arrow(), predicate=predicate, source_alias="source", target_alias="target")
+        dt.merge(_df.to_arrow(), predicate=predicate, source_alias="source", target_alias="target")
         .when_matched_update_all()
         .when_not_matched_insert_all()
         .execute()

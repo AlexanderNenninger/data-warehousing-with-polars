@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from functools import wraps
 from typing import Callable, Literal
@@ -151,7 +152,7 @@ def _write_quarantine(
 
 
 def schema(
-    expect: dict[str, pl.DataType],
+    expect: Mapping[str, pl.DataType | type[pl.DataType]],
     on_missing: Literal["raise", "drop", "quarantine"] = "raise",
     on_extra: Literal["ignore", "raise", "drop"] = "ignore",
     evolution: Literal["strict", "cast", "merge"] = "strict",

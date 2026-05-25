@@ -41,18 +41,20 @@ def _write_partitioned_parquet(src: Path, *, id_offset: int = 0) -> float:
         partition_dir.mkdir(parents=True, exist_ok=True)
         start = id_offset + p * ROWS_PER_PARTITION
         ids = list(range(start, start + ROWS_PER_PARTITION))
-        df = pl.DataFrame({
-            "id": ids,
-            "value": [float(i) for i in range(ROWS_PER_PARTITION)],
-            "metric_a": [float(i) * 1.1 for i in range(ROWS_PER_PARTITION)],
-            "metric_b": [float(i) * 2.2 for i in range(ROWS_PER_PARTITION)],
-            "metric_c": [float(i) * 3.3 for i in range(ROWS_PER_PARTITION)],
-            "metric_d": [float(i) * 4.4 for i in range(ROWS_PER_PARTITION)],
-            "metric_e": [float(i) * 5.5 for i in range(ROWS_PER_PARTITION)],
-            "category": [f"category_{i % 10:02d}" for i in ids],
-            "name": [f"item_{i:07d}" for i in ids],
-            "description": [f"Description for item {i:07d} in partition {p:02d}" for i in ids],
-        })
+        df = pl.DataFrame(
+            {
+                "id": ids,
+                "value": [float(i) for i in range(ROWS_PER_PARTITION)],
+                "metric_a": [float(i) * 1.1 for i in range(ROWS_PER_PARTITION)],
+                "metric_b": [float(i) * 2.2 for i in range(ROWS_PER_PARTITION)],
+                "metric_c": [float(i) * 3.3 for i in range(ROWS_PER_PARTITION)],
+                "metric_d": [float(i) * 4.4 for i in range(ROWS_PER_PARTITION)],
+                "metric_e": [float(i) * 5.5 for i in range(ROWS_PER_PARTITION)],
+                "category": [f"category_{i % 10:02d}" for i in ids],
+                "name": [f"item_{i:07d}" for i in ids],
+                "description": [f"Description for item {i:07d} in partition {p:02d}" for i in ids],
+            }
+        )
         df.write_parquet(partition_dir / "batch.parquet")
         total_bytes += df.estimated_size()
     return total_bytes / (1024 * 1024)
@@ -64,15 +66,17 @@ def _write_partitioned_csv(src: Path) -> float:
         partition_dir = src / f"date=2024-01-{p + 1:02d}"
         partition_dir.mkdir(parents=True, exist_ok=True)
         start = p * ROWS_PER_PARTITION
-        df = pl.DataFrame({
-            "id": list(range(start, start + ROWS_PER_PARTITION)),
-            "value": [float(i) for i in range(ROWS_PER_PARTITION)],
-            "metric_a": [float(i) * 1.1 for i in range(ROWS_PER_PARTITION)],
-            "metric_b": [float(i) * 2.2 for i in range(ROWS_PER_PARTITION)],
-            "metric_c": [float(i) * 3.3 for i in range(ROWS_PER_PARTITION)],
-            "metric_d": [float(i) * 4.4 for i in range(ROWS_PER_PARTITION)],
-            "metric_e": [float(i) * 5.5 for i in range(ROWS_PER_PARTITION)],
-        })
+        df = pl.DataFrame(
+            {
+                "id": list(range(start, start + ROWS_PER_PARTITION)),
+                "value": [float(i) for i in range(ROWS_PER_PARTITION)],
+                "metric_a": [float(i) * 1.1 for i in range(ROWS_PER_PARTITION)],
+                "metric_b": [float(i) * 2.2 for i in range(ROWS_PER_PARTITION)],
+                "metric_c": [float(i) * 3.3 for i in range(ROWS_PER_PARTITION)],
+                "metric_d": [float(i) * 4.4 for i in range(ROWS_PER_PARTITION)],
+                "metric_e": [float(i) * 5.5 for i in range(ROWS_PER_PARTITION)],
+            }
+        )
         df.write_csv(partition_dir / "batch.csv")
         total_bytes += df.estimated_size()
     return total_bytes / (1024 * 1024)
@@ -84,15 +88,17 @@ def _write_partitioned_ndjson(src: Path) -> float:
         partition_dir = src / f"date=2024-01-{p + 1:02d}"
         partition_dir.mkdir(parents=True, exist_ok=True)
         start = p * ROWS_PER_PARTITION
-        df = pl.DataFrame({
-            "id": list(range(start, start + ROWS_PER_PARTITION)),
-            "value": [float(i) for i in range(ROWS_PER_PARTITION)],
-            "metric_a": [float(i) * 1.1 for i in range(ROWS_PER_PARTITION)],
-            "metric_b": [float(i) * 2.2 for i in range(ROWS_PER_PARTITION)],
-            "metric_c": [float(i) * 3.3 for i in range(ROWS_PER_PARTITION)],
-            "metric_d": [float(i) * 4.4 for i in range(ROWS_PER_PARTITION)],
-            "metric_e": [float(i) * 5.5 for i in range(ROWS_PER_PARTITION)],
-        })
+        df = pl.DataFrame(
+            {
+                "id": list(range(start, start + ROWS_PER_PARTITION)),
+                "value": [float(i) for i in range(ROWS_PER_PARTITION)],
+                "metric_a": [float(i) * 1.1 for i in range(ROWS_PER_PARTITION)],
+                "metric_b": [float(i) * 2.2 for i in range(ROWS_PER_PARTITION)],
+                "metric_c": [float(i) * 3.3 for i in range(ROWS_PER_PARTITION)],
+                "metric_d": [float(i) * 4.4 for i in range(ROWS_PER_PARTITION)],
+                "metric_e": [float(i) * 5.5 for i in range(ROWS_PER_PARTITION)],
+            }
+        )
         df.write_ndjson(partition_dir / "batch.ndjson")
         total_bytes += df.estimated_size()
     return total_bytes / (1024 * 1024)
@@ -269,18 +275,22 @@ def run_delta_cdf(tmp_path: str) -> None:
     for part in range(N_PARTITIONS):
         start = part * ROWS_PER_PARTITION
         ids = list(range(start, start + ROWS_PER_PARTITION))
-        df = pl.DataFrame({
-            "id": ids,
-            "value": [float(i) for i in range(ROWS_PER_PARTITION)],
-            "metric_a": [float(i) * 1.1 for i in range(ROWS_PER_PARTITION)],
-            "metric_b": [float(i) * 2.2 for i in range(ROWS_PER_PARTITION)],
-            "metric_c": [float(i) * 3.3 for i in range(ROWS_PER_PARTITION)],
-            "metric_d": [float(i) * 4.4 for i in range(ROWS_PER_PARTITION)],
-            "metric_e": [float(i) * 5.5 for i in range(ROWS_PER_PARTITION)],
-            "category": [f"category_{i % 10:02d}" for i in ids],
-            "name": [f"item_{i:07d}" for i in ids],
-            "description": [f"Description for item {i:07d} in partition {part:02d}" for i in ids],
-        })
+        df = pl.DataFrame(
+            {
+                "id": ids,
+                "value": [float(i) for i in range(ROWS_PER_PARTITION)],
+                "metric_a": [float(i) * 1.1 for i in range(ROWS_PER_PARTITION)],
+                "metric_b": [float(i) * 2.2 for i in range(ROWS_PER_PARTITION)],
+                "metric_c": [float(i) * 3.3 for i in range(ROWS_PER_PARTITION)],
+                "metric_d": [float(i) * 4.4 for i in range(ROWS_PER_PARTITION)],
+                "metric_e": [float(i) * 5.5 for i in range(ROWS_PER_PARTITION)],
+                "category": [f"category_{i % 10:02d}" for i in ids],
+                "name": [f"item_{i:07d}" for i in ids],
+                "description": [
+                    f"Description for item {i:07d} in partition {part:02d}" for i in ids
+                ],
+            }
+        )
         write_deltalake(
             source,
             df.to_arrow(),
@@ -336,18 +346,20 @@ def run_streaming_append_sublinear(tmp_path: str) -> None:
     # Seed the target table so the real pipeline performs a streaming append.
     seed_src = p / "seed_src"
     seed_src.mkdir()
-    pl.DataFrame({
-        "id": [-1],
-        "value": [-1.0],
-        "metric_a": [-1.0],
-        "metric_b": [-1.0],
-        "metric_c": [-1.0],
-        "metric_d": [-1.0],
-        "metric_e": [-1.0],
-        "category": ["_seed"],
-        "name": ["_seed_0000001"],
-        "description": ["_seed_row"],
-    }).write_parquet(seed_src / "seed.parquet")
+    pl.DataFrame(
+        {
+            "id": [-1],
+            "value": [-1.0],
+            "metric_a": [-1.0],
+            "metric_b": [-1.0],
+            "metric_c": [-1.0],
+            "metric_d": [-1.0],
+            "metric_e": [-1.0],
+            "category": ["_seed"],
+            "name": ["_seed_0000001"],
+            "description": ["_seed_row"],
+        }
+    ).write_parquet(seed_src / "seed.parquet")
 
     @incremental(source=str(seed_src), target=target)
     def pipeline_seed(lf: pl.LazyFrame) -> pl.LazyFrame:
