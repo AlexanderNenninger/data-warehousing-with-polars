@@ -42,11 +42,12 @@ class SchemaViolation:
         actual:   The actual dtype as a string, or ``None`` for
                   ``"missing"`` issues.
 
-    Example::
+    Examples:
+        ::
 
-        v = SchemaViolation("price", "type_mismatch", "Float64", "String")
-        print(v)           # SchemaViolation(column='price', issue='type_mismatch', ...)
-        print(v.to_dict()) # {"column": "price", "issue": "type_mismatch", ...}
+            v = SchemaViolation("price", "type_mismatch", "Float64", "String")
+            print(v)           # SchemaViolation(column='price', issue='type_mismatch', ...)
+            print(v.to_dict()) # {"column": "price", "issue": "type_mismatch", ...}
     """
 
     def __init__(
@@ -84,14 +85,15 @@ class SchemaError(Exception):
         violations: List of :class:`SchemaViolation` instances describing
                     every column-level issue found in the batch.
 
-    Example::
+    Examples:
+        ::
 
-        try:
-            result = transform(lf).collect()
-        except SchemaError as e:
-            print(e)  # human-readable summary of all violations
-            for v in e.violations:
-                print(v.column, v.issue, v.expected, v.actual)
+            try:
+                result = transform(lf).collect()
+            except SchemaError as e:
+                print(e)  # human-readable summary of all violations
+                for v in e.violations:
+                    print(v.column, v.issue, v.expected, v.actual)
     """
 
     def __init__(self, violations: list[SchemaViolation]) -> None:

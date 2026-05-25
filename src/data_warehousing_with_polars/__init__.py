@@ -2,13 +2,10 @@
 
 __version__ = "0.1.0"
 
-from data_warehousing_with_polars.incremental import IncrementalPipeline, incremental
-from data_warehousing_with_polars.schema import SchemaError, SchemaViolation, schema
+from data_warehousing_with_polars.incremental import incremental
+from data_warehousing_with_polars.schema import schema
 
 __all__ = [
     "incremental",
-    "IncrementalPipeline",
     "schema",
-    "SchemaError",
-    "SchemaViolation",
 ]
