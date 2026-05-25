@@ -1,0 +1,72 @@
+---
+title: Why Polars + Delta Lake Makes a Surprisingly Complete Data Warehouse
+---
+
+Most teams want three things from a warehouse pipeline:
+
+1. incremental ingestion,
+2. safe table writes,
+3. maintainable transformation logic.
+
+This project combines [Polars](https://pola.rs) and [Delta Lake](https://delta.io) to deliver exactly that with a small Python API. Instead of building pipeline state tracking, merge logic, and table maintenance from scratch, you define a transformation once and let the library orchestrate the operational pieces.
+
+## The core idea
+
+You write a function that maps `LazyFrame -> LazyFrame` and decorate it with [`@incremental`](../reference/incremental.incremental.qmd):
+
+```python
+from data_warehousing_with_polars import incremental
+import polars as pl
+
+@incremental(source="/data/uploads", target="/data/delta/users", merge_on="id")
+def users(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf.filter(pl.col("is_deleted") == False)
+```
+
+From there, `.run()` handles:
+
+- discovering new input files,
+- skipping already processed files,
+- writing to Delta,
+- upserting on key when `merge_on` is provided,
+- and persisting ingest state for the next run.
+
+## Why this can replace heavier stacks for many use cases
+
+For small-to-medium pipelines, you often do not need Spark clusters, a separate orchestration DSL, and a separate warehouse modeling layer just to load and maintain clean Delta tables. The library already gives you:
+
+- watermark-based incremental processing,
+- SCD Type 1/2/4 semantics,
+- schema validation at ingestion boundaries,
+- compaction and vacuum hooks for table health.
+
+That means your transformation functions stay focused on business logic rather than warehouse plumbing.
+
+## Hello-world incremental upsert
+
+```python
+from data_warehousing_with_polars import incremental
+import polars as pl
+
+@incremental(source="/data/raw/customers", target="/data/delta/customers", merge_on="customer_id")
+def clean_customers(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return (
+        lf.with_columns(pl.col("email").str.to_lowercase())
+          .filter(pl.col("customer_id").is_not_null())
+    )
+
+clean_customers.run()
+```
+
+On the first run, the target table is created. On later runs, only unseen files are processed, and matching keys are updated in-place (SCD Type 1 behavior).
+
+## What this series covers next
+
+In the next posts we drill into:
+
+- watermark internals and idempotency,
+- SCD strategy trade-offs,
+- schema enforcement and quarantine flows,
+- fan-in and Delta Change Data Feed,
+- compaction, Z-ordering, and vacuuming,
+- and a full real-world walk-through across six Munich datasets.

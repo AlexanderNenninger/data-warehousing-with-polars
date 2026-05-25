@@ -1,0 +1,48 @@
+---
+title: Watermarks — Never Reprocess a File You've Already Seen
+---
+
+Incremental ingestion sounds simple until you hit operational reality:
+
+- processes crash mid-run,
+- files are retried,
+- jobs restart on new machines,
+- and you must avoid duplicate writes.
+
+This project solves that with a Delta-backed watermark table.
+
+## The problem watermarks solve
+
+A batch run needs a stable answer to: *which inputs are already committed to the target table?*
+
+Tracking this in memory is not enough. Tracking it in local files is brittle. The library records processing state in Delta so each run can resume correctly after restarts.
+
+## How this library stores watermark state
+
+By default, the watermark lives at:
+
+`<target>/.watermark`
+
+For file-based sources, each successfully ingested path is written with an `ingested_at` timestamp after the target write succeeds. That write-after-success ordering is the key safety property.
+
+If a run crashes before the target commit, nothing is marked as processed. If it crashes after the target commit but before watermark update, the same files are retried on next run, preserving at-least-once semantics.
+
+## Day-to-day controls
+
+`IncrementalPipeline` exposes operational helpers:
+
+- `run(dry_run=True)` to preview new inputs,
+- `status()` to inspect current watermark rows,
+- `reset()` to clear state and force full reprocessing.
+
+These are useful in production debugging when you need to validate what the pipeline thinks it has seen.
+
+## Delta source variant: version watermarks
+
+When `file_format="delta"`, the source is another Delta table read via Change Data Feed (CDF). In that mode, watermarking tracks the latest processed source **version**, not file paths.
+
+So the same concept remains: process only unseen source changes and persist progress across runs. The tracked unit changes from path-based checkpoints to version-based checkpoints.
+
+## Why this matters
+
+Watermarks give you reproducibility and safe retries. Without them, incremental ingestion quickly turns into ad hoc dedup logic at every downstream table. With them, idempotency is built into the pipeline contract.

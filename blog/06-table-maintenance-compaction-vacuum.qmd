@@ -1,0 +1,45 @@
+---
+title: Table Maintenance — Compaction, Z-Ordering, and Vacuuming
+---
+
+Incremental writes are great for freshness, but they naturally create many small files over time. Without maintenance, read performance degrades and storage costs drift upward.
+
+This project exposes table maintenance directly via `maintain()` and optional `compact_every` scheduling.
+
+## Why maintenance is necessary
+
+Frequent appends and merges fragment table layout. Query engines then scan more files and metadata than necessary. Compaction and Z-ordering restore read efficiency.
+
+## `maintain()` capabilities
+
+You can request:
+
+- **compaction** (coalesce small files),
+- **Z-ordering** (`z_order_by`) for better pruning on common filter columns,
+- **vacuum** to delete stale files older than retention.
+
+These operations are expressed in one API so teams can run them manually or from scheduled jobs.
+
+## Ordering guarantee: compact before vacuum
+
+When both are enabled, the library runs compaction first and vacuum second. This ordering is crucial: vacuum-before-compaction can remove files you still need for safe rewrite behavior and time-travel windows.
+
+## Automatic trigger with `compact_every`
+
+Instead of external scheduling for every pipeline, `compact_every=N` compacts after every N successful runs.
+
+The trigger state is persisted in a run-counter Delta sub-table at:
+
+`<watermark_store>/_runs`
+
+Because this counter is persisted, behavior remains stable across process restarts.
+
+## Practical scheduling guidance
+
+A common pattern is:
+
+- ingestion runs hourly (or faster),
+- compaction weekly,
+- vacuum daily with retention that matches governance requirements.
+
+The separate `maintenance.py` module keeps this operational concern isolated from ingestion logic, which helps keep pipeline code clear.

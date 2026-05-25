@@ -1,0 +1,51 @@
+---
+title: Real-World Example — Six Munich Open Datasets
+---
+
+The best way to understand the framework is through the six Munich examples included in this project:
+
+- traffic accidents,
+- airport traffic,
+- cycling counters,
+- EV registrations,
+- labor indicators,
+- tourism metrics.
+
+## Common end-to-end pattern
+
+Each example follows the same architecture:
+
+1. load external public source files,
+2. validate/shape data with `@schema` and Polars transforms,
+3. persist curated Delta tables via `@incremental`,
+4. build visual analysis in Quarto + Altair.
+
+This repeatable flow is exactly what you want in production data warehousing: one consistent contract from raw ingestion to analytical consumption.
+
+## Snapshot-replacement vs append-only inputs
+
+The examples are especially useful because they include snapshot-style datasets (where suppliers republish full files) and naturally additive series.
+
+With watermarking and merge semantics, both source behaviors can be handled without rewriting pipeline architecture.
+
+## Cloud storage in practice
+
+Examples are configured to read/write Delta tables using environment-driven bucket paths. This keeps notebooks portable across local runs, CI, and cloud storage backends.
+
+## Lessons learned from the collection
+
+Across the six datasets, a few operational lessons repeat:
+
+- choose partition columns based on query filters, not source shape,
+- allow controlled schema evolution where source owners change formats,
+- keep reset workflows explicit for backfills and historical corrections,
+- and apply maintenance regularly to preserve read performance.
+
+## Where to go next
+
+After walking through these examples, a natural next step is to replicate the same pattern on your own domain data:
+
+- land raw files in a stable path,
+- codify transform + schema contracts,
+- select SCD strategy per entity,
+- and automate maintenance as part of platform operations.

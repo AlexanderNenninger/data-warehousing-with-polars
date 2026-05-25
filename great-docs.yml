@@ -71,6 +71,10 @@ reference:
       - schema.schema
 
 sections:
+  - title: Blog
+    dir: blog
+    index: false
+
   - title: Examples
     dir: examples
     index: false

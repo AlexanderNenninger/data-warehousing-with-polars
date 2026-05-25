@@ -1,0 +1,53 @@
+---
+title: SCD Type 1, 2, and 4 — Choosing Your History Strategy
+---
+
+Warehouse table design is mostly about one question:
+
+**Do you only need current state, or do you need history too?**
+
+This library supports SCD Type 1, 2, and 4 so you can choose per pipeline.
+
+## SCD Type 1 (default): latest state only
+
+With `merge_on=...` and default `scd_type=1`, each run upserts rows by key:
+
+- matching key -> update existing row,
+- new key -> insert row.
+
+Use this when analytics only needs current values and historical versions are not required.
+
+## SCD Type 2: full in-table history
+
+With `scd_type=2`, the library keeps row history directly in the same table by adding:
+
+- `valid_from`,
+- `valid_to`,
+- `is_current`.
+
+When a key changes, previous current rows are closed (`valid_to` set, `is_current=false`) and a new current row is appended.
+
+This enables point-in-time queries without joining to a separate history table.
+
+A practical detail in the implementation: appends are deduplicated on `(merge_on, valid_from)` to keep re-runs idempotent for the same input batch.
+
+## SCD Type 4: split current and history tables
+
+With `scd_type=4`, you provide `history_target=...` and get:
+
+- a compact main table containing current state,
+- a separate append-only history table containing superseded versions with `superseded_at`.
+
+Choose this when you want fast current-state reads while still retaining historical auditability.
+
+## Implementation note from `scd.py`
+
+The SCD2 merge flow intentionally keeps `target.is_current = true` in the matched-update predicate instead of the outer merge predicate. This avoids a known Delta kernel stats issue around boolean columns in min/max metadata.
+
+This is a good example of why encoding SCD behavior in one shared library is valuable: operational edge cases are solved once and reused consistently.
+
+## How to choose
+
+- **Type 1**: simplest, smallest table, no history.
+- **Type 2**: full temporal history in one table, easiest point-in-time modeling.
+- **Type 4**: current-state performance plus separate historical archive.

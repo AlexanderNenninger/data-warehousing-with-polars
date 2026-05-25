@@ -1,0 +1,38 @@
+---
+title: Fan-In Pipelines and Delta Change Data Feed
+---
+
+Two capabilities unlock more complex incremental architectures:
+
+1. ingesting from multiple source directories in one run,
+2. ingesting changes from an upstream Delta table via CDF.
+
+This library supports both with the same decorator surface.
+
+## Fan-in with multiple source paths
+
+`source` can be a list of directories. Each source contributes one `LazyFrame` argument to the transform function in source order.
+
+If a source has no new files in a run, it is omitted, so argument count can vary across runs.
+
+For dynamic fan-in, define transforms with `*lfs` and concatenate or union them programmatically.
+
+This makes it easy to model multi-region or multi-system landing zones without writing separate pipelines per source.
+
+## Delta as a source with Change Data Feed
+
+Set `file_format="delta"` to ingest from another Delta table using CDF. The first run loads baseline state; subsequent runs process only rows changed since the last tracked source version.
+
+CDF metadata columns are removed before your transform receives the frame, keeping business logic clean.
+
+## Streaming bridge: Arrow record batches -> Polars lazy execution
+
+Under the hood, `record_batch_source.py` wraps a PyArrow `RecordBatchReader` via Polars' `register_io_source` API.
+
+Why this matters:
+
+- batch-by-batch streaming avoids loading full change sets eagerly,
+- the integration preserves optimizer features like projection and row limits,
+- and CDF ingestion remains aligned with lazy transformation patterns.
+
+The result is a clean abstraction: your transform still sees `LazyFrame` inputs while the library handles low-level source plumbing.

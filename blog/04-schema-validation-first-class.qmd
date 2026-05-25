@@ -1,0 +1,58 @@
+---
+title: Schema Validation as a First-Class Concern
+---
+
+Bad source schemas are one of the fastest ways to corrupt downstream warehouse tables. This project treats schema validation as a dedicated ingestion-layer concern through [`@schema`](../reference/schema.schema.qmd).
+
+## Why validate at ingestion boundaries
+
+If you defer schema checks until late in the pipeline, invalid batches can already contaminate Delta tables and force expensive cleanup. Validating at the transform boundary prevents that drift from propagating.
+
+## How `@schema` composes
+
+`@schema` wraps a `LazyFrame -> LazyFrame` function directly and composes naturally under `@incremental`. It can also be used standalone outside incremental ingestion.
+
+That keeps schema policy decoupled from file listing, watermark logic, and write semantics.
+
+## Three policy dimensions
+
+1. **Missing expected columns (`on_missing`)**
+   - `raise`
+   - `drop`
+   - `quarantine`
+
+2. **Unexpected extra columns (`on_extra`)**
+   - `ignore`
+   - `raise`
+   - `drop`
+
+3. **Type mismatches (`evolution`)**
+   - `strict`
+   - `cast`
+   - `merge`
+
+Together these allow strict contracts for critical tables and controlled evolution for sources that drift.
+
+## Quarantine pattern
+
+When configured with `on_missing="quarantine"`, rejected batches are written to a quarantine Delta table and annotated with:
+
+- `_violations` (JSON details),
+- `_quarantined_at` timestamp.
+
+This gives operations teams a concrete backlog of bad batches to inspect and replay.
+
+## Lazy-first design
+
+Validation inspects schema metadata first (`collect_schema`) and avoids materializing rows unless quarantine handling requires writing the rejected batch. So happy-path execution stays lazy.
+
+## Example: Munich accidents pipeline
+
+The Munich accidents example demonstrates the exact production pattern:
+
+- expected schema declared,
+- missing fields quarantined,
+- extra fields dropped,
+- controlled type casts for evolution.
+
+That balances reliability with real-world source variability.
