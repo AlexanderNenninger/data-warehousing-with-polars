@@ -70,6 +70,11 @@ reference:
       - incremental.incremental
       - schema.schema
 
+sections:
+  - title: Examples
+    dir: examples
+    index: false
+
 
 # Site Settings
 # -------------

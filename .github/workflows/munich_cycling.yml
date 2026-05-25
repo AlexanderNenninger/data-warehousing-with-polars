@@ -1,0 +1,31 @@
+name: Munich Cycling Pipeline
+
+on:
+  schedule:
+    # Run on the 3rd of every month at 08:00 UTC — giving the city a few days
+    # after month-end to publish the previous month's data.
+    - cron: "0 8 3 * *"
+  workflow_dispatch: # allow manual trigger from the Actions UI
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install library
+        run: pip install -e .
+
+      - name: Run pipeline
+        run: python app/munich_cycling.py
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          MUNICH_CYCLING_BUCKET: ${{ secrets.MUNICH_CYCLING_BUCKET || 'data-warehousing-with-polars' }}

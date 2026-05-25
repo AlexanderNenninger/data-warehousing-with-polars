@@ -1,0 +1,163 @@
+---
+title: Munich Cycling Counters
+---
+
+Munich's [Raddauerzählstellen](https://opendata.muenchen.de/dataset/daten-der-raddauerzaehlstellen-muenchen-2024)
+are permanent automated counters that log cyclists at key roads across the city.
+This demo ingests the open-data CSVs into two Delta Lake tables on S3 — one with
+15-minute granularity, one with daily totals and weather observations — using the
+[`@incremental`](../reference/incremental.incremental.qmd) and
+[`@schema`](../reference/schema.schema.qmd) decorators.
+
+**Data source:** Mobilitätsreferat LHM, 2022–present ·
+License: [Datenlizenz Deutschland – Namensnennung 2.0](https://www.govdata.de/dl-de/by-2-0)
+
+```{python}
+#| echo: false
+import os
+from pathlib import Path
+
+import altair as alt
+import polars as pl
+
+# Load .env for local rendering (ignored in CI where env vars come from secrets).
+_env = Path("..") / ".env"
+if _env.exists():
+    for _line in _env.read_text().splitlines():
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _, _v = _line.partition("=")
+            os.environ.setdefault(_k.strip(), _v.strip())
+
+BUCKET = os.environ.get("MUNICH_CYCLING_BUCKET", "data-warehousing-with-polars")
+```
+
+```{python}
+#| echo: false
+daily = (
+    pl.scan_delta(f"s3://{BUCKET}/delta/munich_cycling_daily")
+    .select("datum", "zaehlstelle", "gesamt", "min_temp", "max_temp",
+            "niederschlag", "sonnenstunden")
+    .collect()
+    .sort("datum")
+)
+daily.head(5)
+```
+
+## City-wide daily counts
+
+Total cyclists counted across all stations each day (2022 – present).
+
+```{python}
+#| echo: false
+totals = (
+    daily.group_by("datum")
+    .agg(pl.col("gesamt").sum().alias("total"))
+    .sort("datum")
+    .with_columns(
+        pl.col("total").rolling_mean(window_size=28).alias("rolling_28d")
+    )
+)
+
+base = alt.Chart(totals).encode(x=alt.X("datum:T", title="Date"))
+
+raw = base.mark_line(opacity=0.25, color="#4C78A8").encode(
+    y=alt.Y("total:Q", title="Cyclists per day")
+)
+smooth = base.mark_line(color="#4C78A8", strokeWidth=2).encode(
+    y="rolling_28d:Q",
+    tooltip=[
+        alt.Tooltip("datum:T", title="Date", format="%b %Y"),
+        alt.Tooltip("rolling_28d:Q", title="28-day avg", format=",.0f"),
+    ],
+)
+
+(raw + smooth).properties(width="container", height=260).configure_view(
+    strokeWidth=0
+)
+```
+
+## Seasonality — average counts by month
+
+Average daily cyclists per month of year, broken out by year, showing the strong
+summer peak and winter trough.
+
+```{python}
+#| echo: false
+monthly = (
+    daily.with_columns(
+        pl.col("datum").dt.month().alias("month"),
+        pl.col("datum").dt.year().cast(pl.Utf8).alias("year"),
+    )
+    .group_by("year", "month")
+    .agg(pl.col("gesamt").mean().alias("avg_daily"))
+    .sort("year", "month")
+    .with_columns(
+        pl.col("month").cast(pl.Utf8).str.zfill(2).alias("month_label")
+    )
+)
+
+alt.Chart(monthly).mark_line(point=True).encode(
+    x=alt.X("month:O", title="Month", axis=alt.Axis(labelExpr=(
+        "['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][datum.value - 1]"
+    ))),
+    y=alt.Y("avg_daily:Q", title="Avg cyclists / day"),
+    color=alt.Color("year:N", title="Year"),
+    tooltip=[
+        alt.Tooltip("year:N", title="Year"),
+        alt.Tooltip("month:O", title="Month"),
+        alt.Tooltip("avg_daily:Q", title="Avg/day", format=",.0f"),
+    ],
+).properties(width="container", height=260).configure_view(strokeWidth=0)
+```
+
+## Temperature and cycling
+
+Daily median temperature vs total cyclists counted (all stations, all days with
+valid temperature readings). Each point is one day; warmer days consistently
+attract more riders.
+
+```{python}
+#| echo: false
+weather = (
+    daily.filter(pl.col("max_temp").is_not_null())
+    .group_by("datum")
+    .agg(
+        pl.col("gesamt").sum().alias("total"),
+        pl.col("max_temp").mean().alias("max_temp"),
+        pl.col("datum").dt.year().cast(pl.Utf8).first().alias("year"),
+    )
+)
+
+alt.Chart(weather).mark_point(opacity=0.4, size=30).encode(
+    x=alt.X("max_temp:Q", title="Max temperature (°C)"),
+    y=alt.Y("total:Q", title="Cyclists per day"),
+    color=alt.Color("year:N", title="Year"),
+    tooltip=[
+        alt.Tooltip("datum:T", title="Date", format="%d %b %Y"),
+        alt.Tooltip("max_temp:Q", title="Max temp (°C)", format=".1f"),
+        alt.Tooltip("total:Q", title="Total cyclists", format=",.0f"),
+    ],
+).properties(width="container", height=260).configure_view(strokeWidth=0)
+```
+
+## Top stations by average daily volume
+
+```{python}
+#| echo: false
+top_stations = (
+    daily.group_by("zaehlstelle")
+    .agg(pl.col("gesamt").mean().round(0).alias("avg_daily"))
+    .sort("avg_daily", descending=True)
+    .head(12)
+)
+
+alt.Chart(top_stations).mark_bar().encode(
+    x=alt.X("avg_daily:Q", title="Avg cyclists / day"),
+    y=alt.Y("zaehlstelle:N", sort="-x", title=None),
+    color=alt.value("#4C78A8"),
+    tooltip=[
+        alt.Tooltip("zaehlstelle:N", title="Station"),
+        alt.Tooltip("avg_daily:Q", title="Avg/day", format=",.0f"),
+    ],
+).properties(width="container", height=320).configure_view(strokeWidth=0)
+```
