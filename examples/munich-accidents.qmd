@@ -1,0 +1,168 @@
+---
+title: Munich Traffic Accidents
+---
+
+Munich's [Monatszahlen Verkehrsunfälle](https://opendata.muenchen.de/dataset/monatszahlen-verkehrsunfaelle)
+records monthly road-accident counts published by the Statistisches Amt München,
+going back to the 1990s. This demo downloads the full-history CSV from the open
+data portal and upserts it into a Delta Lake table using the
+[`@incremental`](../reference/incremental.incremental.qmd) and
+[`@schema`](../reference/schema.schema.qmd) decorators — a pattern suited to
+"snapshot-replacement" sources where the supplier rewrites the whole file each month.
+
+Three categories are tracked: total accidents, alcohol-related accidents, and
+hit-and-run (*Fluchtunfälle*).
+
+**Data source:** Statistisches Amt München ·
+License: [Datenlizenz Deutschland – Namensnennung 2.0](https://www.govdata.de/dl-de/by-2-0)
+
+```{python}
+#| echo: false
+import os
+from pathlib import Path
+
+import altair as alt
+import polars as pl
+
+_env = Path("..") / ".env"
+if _env.exists():
+    for _line in _env.read_text().splitlines():
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _, _v = _line.partition("=")
+            os.environ.setdefault(_k.strip(), _v.strip())
+
+BUCKET = os.environ.get("MUNICH_CYCLING_BUCKET", "data-warehousing-with-polars")
+```
+
+```{python}
+#| echo: false
+df = (
+    pl.scan_delta(f"s3://{BUCKET}/delta/munich_accidents")
+    .select("MONATSZAHL", "AUSPRAEGUNG", "JAHR", "MONAT", "WERT", "date")
+    .filter(pl.col("AUSPRAEGUNG") == "insgesamt")
+    .collect()
+    .sort("date")
+)
+df.head(5)
+```
+
+## Monthly trend by accident type
+
+Total accidents per month since records began. The 28-day rolling mean
+highlights the long-term trend and smooths over seasonal noise.
+
+```{python}
+#| echo: false
+totals = (
+    df.filter(pl.col("MONATSZAHL") == "Verkehrsunfälle")
+    .drop_nulls("WERT")
+    .sort("date")
+    .with_columns(
+        pl.col("WERT").rolling_mean(window_size=12).alias("rolling_12m")
+    )
+)
+
+base = alt.Chart(totals).encode(x=alt.X("date:T", title="Month"))
+
+raw = base.mark_line(opacity=0.3, color="#e45756").encode(
+    y=alt.Y("WERT:Q", title="Accidents per month"),
+    tooltip=[
+        alt.Tooltip("date:T", title="Month", format="%b %Y"),
+        alt.Tooltip("WERT:Q", title="Accidents", format=",.0f"),
+    ],
+)
+smooth = base.mark_line(color="#e45756", strokeWidth=2).encode(
+    y="rolling_12m:Q",
+    tooltip=[
+        alt.Tooltip("date:T", title="Month", format="%b %Y"),
+        alt.Tooltip("rolling_12m:Q", title="12-month avg", format=",.0f"),
+    ],
+)
+
+(raw + smooth).properties(
+    width="container", height=260, title="Total accidents (Verkehrsunfälle insgesamt)"
+).configure_view(strokeWidth=0)
+```
+
+## All three categories
+
+Comparing total accidents, alcohol-related incidents, and hit-and-run cases on the
+same timeline (12-month rolling average, so the values are on different scales —
+use the category to select/deselect).
+
+```{python}
+#| echo: false
+multi = (
+    df.filter(
+        pl.col("MONATSZAHL").is_in(
+            ["Verkehrsunfälle", "Alkoholunfälle", "Fluchtunfälle"]
+        )
+    )
+    .drop_nulls("WERT")
+    .sort("MONATSZAHL", "date")
+    .with_columns(
+        pl.col("WERT")
+        .rolling_mean(window_size=12)
+        .over("MONATSZAHL")
+        .alias("rolling_12m")
+    )
+)
+
+color_scale = alt.Scale(
+    domain=["Verkehrsunfälle", "Alkoholunfälle", "Fluchtunfälle"],
+    range=["#e45756", "#f58518", "#4c78a8"],
+)
+
+selection = alt.selection_point(fields=["MONATSZAHL"], bind="legend")
+
+alt.Chart(multi).mark_line(strokeWidth=2).encode(
+    x=alt.X("date:T", title="Month"),
+    y=alt.Y("rolling_12m:Q", title="12-month rolling average"),
+    color=alt.Color(
+        "MONATSZAHL:N",
+        scale=color_scale,
+        legend=alt.Legend(title="Category"),
+    ),
+    opacity=alt.condition(selection, alt.value(1), alt.value(0.1)),
+    tooltip=[
+        alt.Tooltip("date:T", title="Month", format="%b %Y"),
+        alt.Tooltip("MONATSZAHL:N", title="Category"),
+        alt.Tooltip("rolling_12m:Q", title="12-month avg", format=",.1f"),
+    ],
+).add_params(selection).properties(
+    width="container",
+    height=280,
+    title="Accident categories — 12-month rolling average",
+).configure_view(strokeWidth=0)
+```
+
+## Seasonality
+
+Average accidents by calendar month (across all available years), showing that
+winter and early-autumn months tend to see more incidents.
+
+```{python}
+#| echo: false
+seasons = (
+    df.filter(pl.col("MONATSZAHL") == "Verkehrsunfälle")
+    .drop_nulls("WERT")
+    .with_columns(
+        pl.col("date").dt.month().alias("month_num"),
+        pl.col("date").dt.strftime("%b").alias("month_name"),
+    )
+    .group_by("month_num", "month_name")
+    .agg(pl.col("WERT").mean().alias("avg_accidents"))
+    .sort("month_num")
+)
+
+alt.Chart(seasons).mark_bar(color="#e45756").encode(
+    x=alt.X("month_name:N", sort=None, title="Month"),
+    y=alt.Y("avg_accidents:Q", title="Average accidents"),
+    tooltip=[
+        alt.Tooltip("month_name:N", title="Month"),
+        alt.Tooltip("avg_accidents:Q", title="Avg accidents", format=",.0f"),
+    ],
+).properties(
+    width="container", height=220, title="Average accidents by month of year"
+).configure_view(strokeWidth=0)
+```

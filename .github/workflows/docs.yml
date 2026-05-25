@@ -6,7 +6,7 @@ on:
       - main
   pull_request:
   workflow_run:
-    workflows: ["Munich Cycling Pipeline"]
+    workflows: ["Munich Cycling Pipeline", "Munich Monatszahlen Pipeline"]
     types: [completed]
 
 jobs:

@@ -1,0 +1,201 @@
+---
+title: Munich Airport Traffic
+---
+
+Munich Airport (MUC) is one of Europe's busiest hubs. The
+[Monatszahlen Flugverkehr](https://opendata.muenchen.de/dataset/monatszahlen-flugverkehr)
+dataset, published monthly by the Statistisches Amt München, records passenger
+volumes and flight movements back to 1992.
+
+This demo applies the same pipeline pattern as the cycling counters: the portal
+publishes a single full-history CSV that is replaced each month, so we download
+it into a date-stamped file, validate with
+[`@schema`](../reference/schema.schema.qmd), and upsert into a Delta Lake table
+using [`@incremental`](../reference/incremental.incremental.qmd). Upsert on the
+natural key `(MONATSZAHL, AUSPRAEGUNG, JAHR, MONAT)` ensures that revised
+figures are corrected automatically without duplicates.
+
+**Data source:** Statistisches Amt München ·
+License: [Datenlizenz Deutschland – Namensnennung 2.0](https://www.govdata.de/dl-de/by-2-0)
+
+```{python}
+#| echo: false
+import os
+from pathlib import Path
+
+import altair as alt
+import polars as pl
+
+_env = Path("..") / ".env"
+if _env.exists():
+    for _line in _env.read_text().splitlines():
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _, _v = _line.partition("=")
+            os.environ.setdefault(_k.strip(), _v.strip())
+
+BUCKET = os.environ.get("MUNICH_CYCLING_BUCKET", "data-warehousing-with-polars")
+```
+
+```{python}
+#| echo: false
+df = (
+    pl.scan_delta(f"s3://{BUCKET}/delta/munich_airport")
+    .select("MONATSZAHL", "AUSPRAEGUNG", "JAHR", "WERT", "date")
+    .collect()
+    .sort("date")
+)
+df.head(5)
+```
+
+## Monthly passenger volume
+
+Total passengers (boarding + alighting + transit) per month since 1992. The
+COVID-19 collapse in 2020 and subsequent recovery are unmistakable.
+
+```{python}
+#| echo: false
+passengers = (
+    df.filter(
+        (pl.col("MONATSZAHL") == "Fluggäste")
+        & (pl.col("AUSPRAEGUNG") == "insgesamt")
+    )
+    .drop_nulls("WERT")
+)
+
+alt.Chart(passengers).mark_area(
+    line={"color": "#4c78a8"},
+    color=alt.Gradient(
+        gradient="linear",
+        stops=[
+            alt.GradientStop(color="rgba(76,120,168,0.6)", offset=0),
+            alt.GradientStop(color="rgba(76,120,168,0.05)", offset=1),
+        ],
+        x1=1, x2=1, y1=1, y2=0,
+    ),
+).encode(
+    x=alt.X("date:T", title="Month"),
+    y=alt.Y("WERT:Q", title="Passengers", axis=alt.Axis(format="~s")),
+    tooltip=[
+        alt.Tooltip("date:T", title="Month", format="%b %Y"),
+        alt.Tooltip("WERT:Q", title="Passengers", format=",.0f"),
+    ],
+).properties(
+    width="container", height=260, title="Munich Airport — total passengers per month"
+).configure_view(strokeWidth=0)
+```
+
+## Passenger breakdown
+
+Departing, arriving, and transit passengers plotted separately, with an
+interactive legend to show/hide categories.
+
+```{python}
+#| echo: false
+breakdown = (
+    df.filter(
+        (pl.col("MONATSZAHL") == "Fluggäste")
+        & (pl.col("AUSPRAEGUNG") != "insgesamt")
+    )
+    .drop_nulls("WERT")
+)
+
+color_scale = alt.Scale(
+    domain=["Einsteigende", "Aussteigende", "Transit"],
+    range=["#4c78a8", "#72b7b2", "#f58518"],
+)
+
+selection = alt.selection_point(fields=["AUSPRAEGUNG"], bind="legend")
+
+alt.Chart(breakdown).mark_line(strokeWidth=1.5).encode(
+    x=alt.X("date:T", title="Month"),
+    y=alt.Y("WERT:Q", title="Passengers", axis=alt.Axis(format="~s")),
+    color=alt.Color(
+        "AUSPRAEGUNG:N",
+        scale=color_scale,
+        legend=alt.Legend(title="Direction"),
+    ),
+    opacity=alt.condition(selection, alt.value(1), alt.value(0.1)),
+    tooltip=[
+        alt.Tooltip("date:T", title="Month", format="%b %Y"),
+        alt.Tooltip("AUSPRAEGUNG:N", title="Direction"),
+        alt.Tooltip("WERT:Q", title="Passengers", format=",.0f"),
+    ],
+).add_params(selection).properties(
+    width="container", height=260, title="Passengers by direction"
+).configure_view(strokeWidth=0)
+```
+
+## Flight movements
+
+Total take-offs and landings per month (passenger flights vs cargo/post),
+showing the airport's traffic composition over time.
+
+```{python}
+#| echo: false
+movements = (
+    df.filter(
+        (pl.col("MONATSZAHL") == "Flugzeugbewegungen")
+        & (pl.col("AUSPRAEGUNG").is_in(["Passagierflüge", "Fracht-/Postflüge"]))
+    )
+    .drop_nulls("WERT")
+)
+
+color_scale2 = alt.Scale(
+    domain=["Passagierflüge", "Fracht-/Postflüge"],
+    range=["#4c78a8", "#e45756"],
+)
+
+selection2 = alt.selection_point(fields=["AUSPRAEGUNG"], bind="legend")
+
+alt.Chart(movements).mark_line(strokeWidth=1.5).encode(
+    x=alt.X("date:T", title="Month"),
+    y=alt.Y("WERT:Q", title="Flight movements", axis=alt.Axis(format="~s")),
+    color=alt.Color(
+        "AUSPRAEGUNG:N",
+        scale=color_scale2,
+        legend=alt.Legend(title="Flight type"),
+    ),
+    opacity=alt.condition(selection2, alt.value(1), alt.value(0.1)),
+    tooltip=[
+        alt.Tooltip("date:T", title="Month", format="%b %Y"),
+        alt.Tooltip("AUSPRAEGUNG:N", title="Type"),
+        alt.Tooltip("WERT:Q", title="Movements", format=",.0f"),
+    ],
+).add_params(selection2).properties(
+    width="container", height=240, title="Flight movements by type"
+).configure_view(strokeWidth=0)
+```
+
+## Seasonality
+
+Average monthly passengers (all years), confirming a strong summer peak and a
+trough in January–February — the pattern COVID disrupted then re-established.
+
+```{python}
+#| echo: false
+seasons = (
+    passengers
+    .with_columns(
+        pl.col("date").dt.month().alias("month_num"),
+        pl.col("date").dt.strftime("%b").alias("month_name"),
+    )
+    .group_by("month_num", "month_name")
+    .agg(pl.col("WERT").mean().alias("avg_passengers"))
+    .sort("month_num")
+)
+
+alt.Chart(seasons).mark_bar(color="#4c78a8").encode(
+    x=alt.X("month_name:N", sort=None, title="Month"),
+    y=alt.Y(
+        "avg_passengers:Q",
+        title="Avg passengers",
+        axis=alt.Axis(format="~s"),
+    ),
+    tooltip=[
+        alt.Tooltip("month_name:N", title="Month"),
+        alt.Tooltip("avg_passengers:Q", title="Avg passengers", format=",.0f"),
+    ],
+).properties(
+    width="container", height=220, title="Average passengers by month of year"
+).configure_view(strokeWidth=0)
+```

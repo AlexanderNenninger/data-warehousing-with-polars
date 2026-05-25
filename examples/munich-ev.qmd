@@ -1,0 +1,203 @@
+---
+title: "Munich EV Adoption"
+---
+
+Munich's [Monatszahlen KFZ-Bestand](https://opendata.muenchen.de/dataset/monatszahlen-kfz-bestand)
+dataset tracks the monthly *registered fleet* of vehicles by fuel type, published
+by the Statistisches Amt München since 1992. It records how many cars run on
+petrol, diesel, electricity, hybrid, or LPG — a direct measure of the
+energy-transition in Munich's roads.
+
+The data is a single full-history CSV that the portal replaces each month. The
+[`@incremental`](../reference/incremental.incremental.qmd) pipeline downloads it
+into a date-stamped staging file and upserts into a Delta Lake table, ensuring
+revised numbers are corrected without creating duplicates.
+
+**Data source:** Statistisches Amt München ·
+License: [Datenlizenz Deutschland – Namensnennung 2.0](https://www.govdata.de/dl-de/by-2-0)
+
+```{python}
+#| echo: false
+import os
+from pathlib import Path
+
+import altair as alt
+import polars as pl
+
+_env = Path("..") / ".env"
+if _env.exists():
+    for _line in _env.read_text().splitlines():
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _, _v = _line.partition("=")
+            os.environ.setdefault(_k.strip(), _v.strip())
+
+BUCKET = os.environ.get("MUNICH_CYCLING_BUCKET", "data-warehousing-with-polars")
+```
+
+```{python}
+#| echo: false
+df = (
+    pl.scan_delta(f"s3://{BUCKET}/delta/munich_vehicles")
+    .select("MONATSZAHL", "AUSPRAEGUNG", "JAHR", "WERT", "date")
+    .collect()
+    .sort("date")
+)
+df.head(5)
+```
+
+## Fleet by fuel type
+
+Total registered passenger cars (Pkw) in Munich by fuel type over time, focusing
+on the shift away from diesel and petrol toward electric and hybrid drivetrains.
+
+```{python}
+#| echo: false
+# Focus on Pkw-Kraftstoffarten (fleet stock by fuel type), private+commercial combined
+fuel = (
+    df.filter(
+        (pl.col("MONATSZAHL") == "Pkw-Kraftstoffarten")
+        & ~pl.col("AUSPRAEGUNG").str.ends_with("gewerblich")
+        & ~pl.col("AUSPRAEGUNG").str.ends_with("privat")
+    )
+    .drop_nulls("WERT")
+)
+
+# Rename for cleaner labels
+fuel = fuel.with_columns(
+    pl.col("AUSPRAEGUNG")
+    .replace({
+        "Elektro": "Electric",
+        "Benzin": "Petrol",
+        "Diesel": "Diesel",
+        "Hybrid": "Hybrid",
+        "Flüssiggas": "LPG",
+        "Gas": "Gas",
+    })
+    .alias("fuel_type")
+)
+
+palette = {
+    "Electric": "#27ae60",
+    "Hybrid":   "#f39c12",
+    "Petrol":   "#3498db",
+    "Diesel":   "#e74c3c",
+    "LPG":      "#9b59b6",
+    "Gas":      "#95a5a6",
+}
+
+color_scale = alt.Scale(
+    domain=list(palette.keys()),
+    range=list(palette.values()),
+)
+
+selection = alt.selection_point(fields=["fuel_type"], bind="legend")
+
+alt.Chart(fuel).mark_line(strokeWidth=2).encode(
+    x=alt.X("date:T", title="Month"),
+    y=alt.Y("WERT:Q", title="Registered cars", axis=alt.Axis(format="~s")),
+    color=alt.Color(
+        "fuel_type:N",
+        scale=color_scale,
+        legend=alt.Legend(title="Fuel type"),
+    ),
+    opacity=alt.condition(selection, alt.value(1), alt.value(0.15)),
+    tooltip=[
+        alt.Tooltip("date:T", title="Month", format="%b %Y"),
+        alt.Tooltip("fuel_type:N", title="Fuel type"),
+        alt.Tooltip("WERT:Q", title="Cars", format=",.0f"),
+    ],
+).add_params(selection).properties(
+    width="container",
+    height=300,
+    title="Registered cars by fuel type (Pkw-Kraftstoffarten)",
+).configure_view(strokeWidth=0)
+```
+
+## EV and hybrid share
+
+Share of electric and hybrid cars as a percentage of the total registered fleet.
+
+```{python}
+#| echo: false
+# Total registered Pkw each month (use Fahrzeugtypen → Personenkraftwagen)
+total_pkw = (
+    df.filter(
+        (pl.col("MONATSZAHL") == "Bestand Fahrzeugtypen")
+        & (pl.col("AUSPRAEGUNG") == "Personenkraftwagen")
+    )
+    .drop_nulls("WERT")
+    .rename({"WERT": "total"})
+    .select("date", "total")
+)
+
+ev_hybrid = (
+    fuel.filter(pl.col("fuel_type").is_in(["Electric", "Hybrid"]))
+    .join(total_pkw, on="date", how="left")
+    .with_columns(
+        (pl.col("WERT") / pl.col("total") * 100).alias("share_pct")
+    )
+    .drop_nulls("share_pct")
+)
+
+ev_color = alt.Scale(
+    domain=["Electric", "Hybrid"],
+    range=["#27ae60", "#f39c12"],
+)
+
+sel_ev = alt.selection_point(fields=["fuel_type"], bind="legend")
+
+alt.Chart(ev_hybrid).mark_line(strokeWidth=2).encode(
+    x=alt.X("date:T", title="Month"),
+    y=alt.Y("share_pct:Q", title="Share of registered cars (%)"),
+    color=alt.Color(
+        "fuel_type:N",
+        scale=ev_color,
+        legend=alt.Legend(title="Fuel type"),
+    ),
+    opacity=alt.condition(sel_ev, alt.value(1), alt.value(0.1)),
+    tooltip=[
+        alt.Tooltip("date:T", title="Month", format="%b %Y"),
+        alt.Tooltip("fuel_type:N", title="Fuel type"),
+        alt.Tooltip("share_pct:Q", title="Fleet share", format=".2f"),
+    ],
+).add_params(sel_ev).properties(
+    width="container",
+    height=260,
+    title="Electric and hybrid share of total registered cars",
+).configure_view(strokeWidth=0)
+```
+
+## EV count — year-over-year growth
+
+Electric-only registrations per month, illustrating the acceleration in EV
+adoption since 2019.
+
+```{python}
+#| echo: false
+ev_only = (
+    fuel.filter(pl.col("fuel_type") == "Electric")
+    .drop_nulls("WERT")
+    .sort("date")
+)
+
+alt.Chart(ev_only).mark_area(
+    line={"color": "#27ae60"},
+    color=alt.Gradient(
+        gradient="linear",
+        stops=[
+            alt.GradientStop(color="rgba(39,174,96,0.6)", offset=0),
+            alt.GradientStop(color="rgba(39,174,96,0.05)", offset=1),
+        ],
+        x1=1, x2=1, y1=1, y2=0,
+    ),
+).encode(
+    x=alt.X("date:T", title="Month"),
+    y=alt.Y("WERT:Q", title="Registered electric cars", axis=alt.Axis(format="~s")),
+    tooltip=[
+        alt.Tooltip("date:T", title="Month", format="%b %Y"),
+        alt.Tooltip("WERT:Q", title="Electric cars", format=",.0f"),
+    ],
+).properties(
+    width="container", height=240, title="Total registered electric cars (Elektro)"
+).configure_view(strokeWidth=0)
+```
