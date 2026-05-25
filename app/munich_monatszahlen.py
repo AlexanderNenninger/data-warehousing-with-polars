@@ -176,7 +176,7 @@ def _ingest(name: str, target: str) -> int:
 
     csv_path = _download(name)
 
-    df_raw = pl.read_csv(str(csv_path), null_values=["NA"], quote_char='"')
+    df_raw = pl.read_csv(str(csv_path), schema_overrides=SCHEMA_MONATSZAHLEN, null_values=["NA"], quote_char='"')
     logger.info("[%s] Raw CSV: %d rows.", name, len(df_raw))
 
     df = _transform(df_raw, str(csv_path))
