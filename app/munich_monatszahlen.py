@@ -108,6 +108,9 @@ def _transform(lf: pl.LazyFrame) -> pl.LazyFrame:
             .str.strptime(pl.Date, "%Y%m", strict=False)
             .alias("date")
         )
+        # Deduplicate on natural merge keys; keep the last occurrence so that any
+        # revised values published by the portal take precedence over earlier ones.
+        .unique(subset=["MONATSZAHL", "AUSPRAEGUNG", "JAHR", "MONAT"], keep="last")
     )
 
 
