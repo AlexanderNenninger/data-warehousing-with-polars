@@ -2,7 +2,7 @@
 Munich Monatszahlen demo pipelines.
 
 Ingests three monthly statistical datasets published by the Statistisches Amt
-München into Delta Lake tables on S3 using data-warehousing-with-polars.
+München into Delta Lake tables on S3.
 
 Three pipelines (all use the same "Monatszahlen Monitoring" CSV schema):
 
@@ -15,10 +15,12 @@ Three pipelines (all use the same "Monatszahlen Monitoring" CSV schema):
   - vehicles    Monatszahlen KFZ-Bestand — monthly vehicle fleet by fuel type,
                 useful for tracking EV adoption in Munich.
 
-Each source is a single full-history CSV that the portal replaces in-place every
-month. The pipelines download it into a date-stamped file so the incremental
-watermark sees each monthly run as a new file, then upsert into the Delta table
-on the natural keys (MONATSZAHL, AUSPRAEGUNG, JAHR, MONAT).
+Each source is a **single full-history CSV** that the data portal replaces
+in-place every month.  Because the authoritative source is always the latest
+complete file, the correct write strategy is *overwrite* rather than *merge*:
+each monthly run downloads the file, transforms and deduplicates the data, and
+atomically replaces the Delta table.  A lightweight month-stamp watermark stored
+alongside the table prevents duplicate processing within the same calendar month.
 
 Data:    Statistisches Amt München
          https://opendata.muenchen.de/pages/monatszahlen-monitoring
@@ -37,12 +39,11 @@ from __future__ import annotations
 import logging
 import os
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import polars as pl
-
-from data_warehousing_with_polars import incremental, schema
+from deltalake import write_deltalake
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -51,7 +52,6 @@ logger = logging.getLogger(__name__)
 
 BUCKET = os.environ.get("MUNICH_CYCLING_BUCKET", "data-warehousing-with-polars")
 
-# Dataset URLs from the Munich Open Data CKAN portal.
 _URLS = {
     "accidents": (
         "https://opendata.muenchen.de/dataset/5e73a82b-7cfb-40cc-9b30-45fe5a3fa24e"
@@ -67,144 +67,145 @@ _URLS = {
     ),
 }
 
-# Stable local staging roots.
 _STAGING = Path("/tmp/munich_monatszahlen")
 
 # ── Shared schema ─────────────────────────────────────────────────────────────
 
-# All three "Monatszahlen Monitoring" datasets share this exact schema.
 SCHEMA_MONATSZAHLEN = {
     "MONATSZAHL": pl.Utf8,
     "AUSPRAEGUNG": pl.Utf8,
     "JAHR": pl.Int64,
-    "MONAT": pl.Utf8,      # "YYYYMM" for monthly rows, "Summe" for annual totals
-    "WERT": pl.Float64,    # current value (may be null for not-yet-published months)
+    "MONAT": pl.Utf8,
+    "WERT": pl.Float64,
     "VORJAHRESWERT": pl.Float64,
     "VERAEND_VORMONAT_PROZENT": pl.Float64,
     "VERAEND_VORJAHRESMONAT_PROZENT": pl.Float64,
     "ZWOELF_MONATE_MITTELWERT": pl.Float64,
 }
 
-# Natural merge keys — same for all three datasets.
-_MERGE_ON = ["MONATSZAHL", "AUSPRAEGUNG", "JAHR", "MONAT"]
+_NATURAL_KEYS = ["MONATSZAHL", "AUSPRAEGUNG", "JAHR", "MONAT"]
 
 
 # ── Transform ─────────────────────────────────────────────────────────────────
 
 
-def _transform(lf: pl.LazyFrame) -> pl.LazyFrame:
-    """Parse MONAT into a proper date and add a ``date`` column.
+def _transform(df: pl.DataFrame, source_path: str) -> pl.DataFrame:
+    """Filter annual summary rows, parse MONAT into a date, and deduplicate.
 
-    Monthly rows have MONAT in ``YYYYMM`` format (e.g. ``202601``); annual
-    summary rows have MONAT == ``"Summe"``.  Only monthly rows get a real date
-    (the 1st of that month); summary rows are excluded so only regular monthly
-    observations end up in the Delta table.
+    The portal occasionally publishes duplicate rows; deduplication on the
+    natural keys ensures the Delta table stays clean regardless.
     """
+    now = datetime.now(timezone.utc)
     return (
-        lf
+        df.lazy()
         .filter(pl.col("MONAT") != "Summe")
         .with_columns(
-            pl.col("MONAT")
-            .str.strptime(pl.Date, "%Y%m", strict=False)
-            .alias("date")
+            pl.col("MONAT").str.strptime(pl.Date, "%Y%m", strict=False).alias("date"),
+            pl.lit(source_path).alias("_source_file"),
+            pl.lit(now).alias("_ingested_at"),
         )
-        # Deduplicate on natural merge keys; keep the last occurrence so that any
-        # revised values published by the portal take precedence over earlier ones.
-        .unique(subset=["MONATSZAHL", "AUSPRAEGUNG", "JAHR", "MONAT"], keep="last")
+        .unique(subset=_NATURAL_KEYS, keep="last", maintain_order=False)
+        .collect()
     )
 
 
-# ── Pipelines ─────────────────────────────────────────────────────────────────
+# ── Watermark helpers ─────────────────────────────────────────────────────────
 
 
-@incremental(
-    source=str(_STAGING / "accidents"),
-    target=f"s3://{BUCKET}/delta/munich_accidents",
-    merge_on=_MERGE_ON,
-    file_format="csv",
-    reader_kwargs={"null_values": ["NA"], "quote_char": '"'},
-)
-@schema(expect=SCHEMA_MONATSZAHLEN, on_extra="drop", evolution="cast")
-def accidents(lf: pl.LazyFrame) -> pl.LazyFrame:
-    """Monthly Munich road-accident counts (total / injuries / alcohol / hit-and-run)."""
-    return _transform(lf)
+def _already_processed(watermark_store: str, stamp: str) -> bool:
+    """Return True if *stamp* (YYYYMM) is recorded in the watermark table."""
+    try:
+        stamps = (
+            pl.scan_delta(watermark_store).select("stamp").collect()["stamp"].to_list()
+        )
+        return stamp in stamps
+    except Exception:
+        return False
 
 
-@incremental(
-    source=str(_STAGING / "airport"),
-    target=f"s3://{BUCKET}/delta/munich_airport",
-    merge_on=_MERGE_ON,
-    file_format="csv",
-    reader_kwargs={"null_values": ["NA"], "quote_char": '"'},
-)
-@schema(expect=SCHEMA_MONATSZAHLEN, on_extra="drop", evolution="cast")
-def airport(lf: pl.LazyFrame) -> pl.LazyFrame:
-    """Monthly Munich Airport passenger and flight-movement counts."""
-    return _transform(lf)
+def _save_stamp(watermark_store: str, stamp: str, rows: int) -> None:
+    """Append *stamp* with metadata to the watermark table."""
+    wm = pl.DataFrame({
+        "stamp": [stamp],
+        "written_at": [datetime.now(timezone.utc)],
+        "rows": [rows],
+    })
+    write_deltalake(watermark_store, wm.to_arrow(), mode="append")
 
 
-@incremental(
-    source=str(_STAGING / "vehicles"),
-    target=f"s3://{BUCKET}/delta/munich_vehicles",
-    merge_on=_MERGE_ON,
-    file_format="csv",
-    reader_kwargs={"null_values": ["NA"], "quote_char": '"'},
-)
-@schema(expect=SCHEMA_MONATSZAHLEN, on_extra="drop", evolution="cast")
-def vehicles(lf: pl.LazyFrame) -> pl.LazyFrame:
-    """Monthly Munich vehicle fleet by fuel type (Bestand KFZ-Kraftstoffarten)."""
-    return _transform(lf)
+# ── Full-history ingest ───────────────────────────────────────────────────────
 
 
-# ── Fetch helper ──────────────────────────────────────────────────────────────
+def _ingest(name: str, target: str) -> int:
+    """Download, transform, and atomically overwrite the Delta table for *name*.
+
+    Because the source is a full-history file replaced monthly, the correct
+    write strategy is overwrite rather than merge: the latest published CSV is
+    the authoritative version of the complete dataset.
+
+    Returns the number of rows written, or 0 if this month's data was already
+    ingested.
+    """
+    stamp = datetime.now().strftime("%Y%m")
+    watermark_store = target + "/.stamp"
+
+    if _already_processed(watermark_store, stamp):
+        logger.info("[%s] Already processed for %s — skipping.", name, stamp)
+        return 0
+
+    csv_path = _download(name)
+
+    df_raw = pl.read_csv(str(csv_path), null_values=["NA"], quote_char='"')
+    logger.info("[%s] Raw CSV: %d rows.", name, len(df_raw))
+
+    df = _transform(df_raw, str(csv_path))
+    logger.info("[%s] After transform: %d rows.", name, len(df))
+
+    write_deltalake(target, df.to_arrow(), mode="overwrite")
+    _save_stamp(watermark_store, stamp, len(df))
+
+    logger.info("[%s] Overwrite complete — %d rows written.", name, len(df))
+    return len(df)
+
+
+# ── Download helper ───────────────────────────────────────────────────────────
 
 
 def _download(name: str) -> Path:
-    """Download the named Monatszahlen CSV into a date-stamped staging file.
-
-    Using a date-stamped filename means each monthly run produces a *new* file,
-    so the incremental watermark sees it as fresh input and (re-)upserts the
-    latest data into the Delta table.
-    """
+    """Download the named Monatszahlen CSV into a date-stamped staging file."""
     dest_dir = _STAGING / name
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     stamp = datetime.now().strftime("%Y%m")
     dest = dest_dir / f"{name}_{stamp}.csv"
     if dest.exists():
-        logger.info("Already downloaded today: %s", dest.name)
+        logger.info("[%s] Already downloaded: %s", name, dest.name)
         return dest
 
     url = _URLS[name]
-    logger.info("Downloading %s …", url)
+    logger.info("[%s] Downloading %s …", name, url)
     req = urllib.request.Request(url, headers={"User-Agent": "data-warehousing-with-polars-demo"})
     with urllib.request.urlopen(req, timeout=60) as resp, dest.open("wb") as fh:
         fh.write(resp.read())
-    logger.info("Saved → %s", dest)
+    logger.info("[%s] Saved → %s", name, dest.name)
     return dest
-
-
-def fetch_all() -> None:
-    """Download the latest CSV for each dataset into the staging directories."""
-    for name in _URLS:
-        _download(name)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 
 def main() -> None:
-    fetch_all()
-
-    n = accidents.run()
-    logger.info("Accidents pipeline: %d new file(s) ingested.", len(n))
-
-    n = airport.run()
-    logger.info("Airport pipeline: %d new file(s) ingested.", len(n))
-
-    n = vehicles.run()
-    logger.info("Vehicles pipeline: %d new file(s) ingested.", len(n))
+    for name, suffix in [
+        ("accidents", "munich_accidents"),
+        ("airport",   "munich_airport"),
+        ("vehicles",  "munich_vehicles"),
+    ]:
+        target = f"s3://{BUCKET}/delta/{suffix}"
+        n = _ingest(name, target)
+        logger.info("%s: %d rows ingested.", name, n)
 
 
 if __name__ == "__main__":
     main()
+
+
