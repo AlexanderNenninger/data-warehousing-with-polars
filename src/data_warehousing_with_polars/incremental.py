@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Callable, Literal, cast
 
 import polars as pl
 from deltalake import DeltaTable, WriterProperties, write_deltalake
@@ -64,8 +64,7 @@ def _list_s3_files(source: str, suffixes: tuple[str, ...]) -> list[str]:
 def _load_watermark(store: str) -> set[str]:
     """Return file paths recorded in the watermark table. Returns ``set()`` on first run."""
     try:
-        result = pl.scan_delta(store).select("file_path").collect()
-        assert isinstance(result, pl.DataFrame)
+        result = cast(pl.DataFrame, pl.scan_delta(store).select("file_path").collect())
         return set(result["file_path"].to_list())
     except Exception:
         return set()
@@ -85,8 +84,7 @@ def _save_watermark(store: str, paths: list[str]) -> None:
 def _load_delta_watermark(store: str) -> int | None:
     """Return the last processed Delta source version, or ``None`` on first run."""
     try:
-        result = pl.scan_delta(store).select(pl.col("version").max()).collect()
-        assert isinstance(result, pl.DataFrame)
+        result = cast(pl.DataFrame, pl.scan_delta(store).select(pl.col("version").max()).collect())
         val = result["version"][0]
         return int(val) if val is not None else None
     except Exception:
@@ -179,8 +177,7 @@ def _sink_target(
 
     if not keys:
         if first_write:
-            _df = lf.collect()
-            assert isinstance(_df, pl.DataFrame)
+            _df = cast(pl.DataFrame, lf.collect())
             write_deltalake(
                 target,
                 _df.to_arrow(),
@@ -194,8 +191,7 @@ def _sink_target(
             lf.sink_delta(target, mode="append")
         return
 
-    _df = lf.collect(engine="streaming")
-    assert isinstance(_df, pl.DataFrame)
+    _df = cast(pl.DataFrame, lf.collect(engine="streaming"))
 
     if first_write:
         write_deltalake(
@@ -571,8 +567,7 @@ class IncrementalPipeline:
 
     def status(self) -> pl.DataFrame:
         """Return the watermark table as an eager DataFrame."""
-        result = pl.scan_delta(self.watermark_store).collect()
-        assert isinstance(result, pl.DataFrame)
+        result = cast(pl.DataFrame, pl.scan_delta(self.watermark_store).collect())
         return result
 
     def maintain(

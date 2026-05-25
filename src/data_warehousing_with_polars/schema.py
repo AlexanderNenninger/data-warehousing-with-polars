@@ -24,7 +24,7 @@ import logging
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from functools import wraps
-from typing import Callable, Literal
+from typing import Callable, Literal, cast
 
 import polars as pl
 from deltalake import write_deltalake
@@ -138,8 +138,7 @@ def _write_quarantine(
     if store is None:
         return
     try:
-        _raw = lf.collect()
-        assert isinstance(_raw, pl.DataFrame)
+        _raw = cast(pl.DataFrame, lf.collect())
         df = _raw
         violations_json = json.dumps([v.to_dict() for v in violations])
         df = df.with_columns(

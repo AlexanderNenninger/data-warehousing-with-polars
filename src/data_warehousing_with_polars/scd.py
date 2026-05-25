@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from typing import cast
 
 import polars as pl
 from deltalake import DeltaTable, WriterProperties, write_deltalake
@@ -43,8 +44,7 @@ def _sink_scd2(
         pl.lit(None).cast(pl.Datetime("us", "UTC")).alias("valid_to"),
         pl.lit(True).alias("is_current"),
     ).collect()
-    assert isinstance(_raw, pl.DataFrame)
-    df = _raw
+    df = cast(pl.DataFrame, _raw)
 
     try:
         dt = DeltaTable(target)
@@ -82,8 +82,8 @@ def _sink_scd2(
     # for idempotency when the pipeline is re-run on the same batch.
     dedup_cols = keys + ["valid_from"]
     _existing = pl.scan_delta(target).select(dedup_cols).collect()
-    assert isinstance(_existing, pl.DataFrame)
-    new_df = df.join(_existing, on=dedup_cols, how="anti")
+    existing = cast(pl.DataFrame, _existing)
+    new_df = df.join(existing, on=dedup_cols, how="anti")
     if len(new_df) > 0:
         write_deltalake(
             target, new_df.to_arrow(), mode="append", writer_properties=WriterProperties()
@@ -111,8 +111,7 @@ def _sink_scd4(
     )
 
     _raw = lf.collect()
-    assert isinstance(_raw, pl.DataFrame)
-    df = _raw
+    df = cast(pl.DataFrame, _raw)
 
     try:
         dt = DeltaTable(target)
@@ -125,8 +124,7 @@ def _sink_scd4(
             .with_columns(pl.lit(now).alias("superseded_at"))
             .collect()
         )
-        assert isinstance(_current, pl.DataFrame)
-        current = _current
+        current = cast(pl.DataFrame, _current)
         if len(current) > 0:
             try:
                 write_deltalake(

@@ -8,7 +8,7 @@ reads staged Parquet output, and drives the Delta merge locally.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 import polars as pl
 from deltalake import DeltaTable

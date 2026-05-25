@@ -119,8 +119,7 @@ def _transform(df: pl.DataFrame, source_path: str) -> pl.DataFrame:
     """
     now = datetime.now(timezone.utc)
     result = (
-        df
-        .lazy()
+        df.lazy()
         .filter(pl.col("MONAT") != "Summe")
         .with_columns(
             pl.col("MONAT").str.strptime(pl.Date, "%Y%m", strict=False).alias("date"),
@@ -148,11 +147,13 @@ def _already_processed(watermark_store: str, stamp: str) -> bool:
 
 def _save_stamp(watermark_store: str, stamp: str, rows: int) -> None:
     """Append *stamp* with metadata to the watermark table."""
-    wm = pl.DataFrame({
-        "stamp": [stamp],
-        "written_at": [datetime.now(timezone.utc)],
-        "rows": [rows],
-    })
+    wm = pl.DataFrame(
+        {
+            "stamp": [stamp],
+            "written_at": [datetime.now(timezone.utc)],
+            "rows": [rows],
+        }
+    )
     write_deltalake(watermark_store, wm.to_arrow(), mode="append")
 
 
