@@ -33,6 +33,7 @@ dev = [
     "pytest>=9.0.3",
     "pytest-forked>=1.6.0",
     "pytest-memray>=1.8.0",
+    "python-dotenv>=1.2.2",
     "ruff>=0.15.14",
     "ty>=0.0.39",
 ]
