@@ -11,6 +11,7 @@ display_name: "Data Warehousing with Polars"
 
 # Site Settings
 # -------------
+navbar_style: "sky"
 
 # Docstring Parser
 # ----------------
