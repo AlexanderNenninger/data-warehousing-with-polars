@@ -53,6 +53,7 @@ import os
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
 import polars as pl
 from deltalake import write_deltalake
@@ -118,8 +119,7 @@ def _transform(df: pl.DataFrame, source_path: str) -> pl.DataFrame:
     """
     now = datetime.now(timezone.utc)
     result = (
-        df
-        .lazy()
+        df.lazy()
         .filter(pl.col("MONAT") != "Summe")
         .with_columns(
             pl.col("MONAT").str.strptime(pl.Date, "%Y%m", strict=False).alias("date"),
@@ -129,8 +129,7 @@ def _transform(df: pl.DataFrame, source_path: str) -> pl.DataFrame:
         .unique(subset=_NATURAL_KEYS, keep="last", maintain_order=False)
         .collect()
     )
-    assert isinstance(result, pl.DataFrame)
-    return result
+    return cast(pl.DataFrame, result)
 
 
 # ── Watermark helpers ─────────────────────────────────────────────────────────
@@ -139,8 +138,7 @@ def _transform(df: pl.DataFrame, source_path: str) -> pl.DataFrame:
 def _already_processed(watermark_store: str, stamp: str) -> bool:
     """Return True if *stamp* (YYYYMM) is recorded in the watermark table."""
     try:
-        collected = pl.scan_delta(watermark_store).select("stamp").collect()
-        assert isinstance(collected, pl.DataFrame)
+        collected = cast(pl.DataFrame, pl.scan_delta(watermark_store).select("stamp").collect())
         stamps = collected["stamp"].to_list()
         return stamp in stamps
     except Exception:
@@ -149,11 +147,13 @@ def _already_processed(watermark_store: str, stamp: str) -> bool:
 
 def _save_stamp(watermark_store: str, stamp: str, rows: int) -> None:
     """Append *stamp* with metadata to the watermark table."""
-    wm = pl.DataFrame({
-        "stamp": [stamp],
-        "written_at": [datetime.now(timezone.utc)],
-        "rows": [rows],
-    })
+    wm = pl.DataFrame(
+        {
+            "stamp": [stamp],
+            "written_at": [datetime.now(timezone.utc)],
+            "rows": [rows],
+        }
+    )
     write_deltalake(watermark_store, wm.to_arrow(), mode="append")
 
 

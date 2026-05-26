@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Callable, Literal, cast
 
 import polars as pl
 from deltalake import DeltaTable, WriterProperties, write_deltalake
@@ -44,11 +44,27 @@ def _list_local_files(source: str, suffixes: tuple[str, ...]) -> list[str]:
     return sorted(str(p.resolve()) for p in root.rglob("*") if p.is_file() and p.suffix in suffixes)
 
 
+def _list_s3_files(source: str, suffixes: tuple[str, ...]) -> list[str]:
+    """Return sorted S3 URIs of files under *source* matching *suffixes*."""
+    from pyarrow import fs as pa_fs  # noqa: PLC0415
+
+    filesystem, base_path = pa_fs.FileSystem.from_uri(source)
+    selector = pa_fs.FileSelector(base_path.rstrip("/"), recursive=True)
+    try:
+        file_infos = filesystem.get_file_info(selector)
+    except FileNotFoundError:
+        return []
+    return sorted(
+        f"s3://{info.path}"
+        for info in file_infos
+        if info.type == pa_fs.FileType.File and any(info.path.endswith(s) for s in suffixes)
+    )
+
+
 def _load_watermark(store: str) -> set[str]:
     """Return file paths recorded in the watermark table. Returns ``set()`` on first run."""
     try:
-        result = pl.scan_delta(store).select("file_path").collect()
-        assert isinstance(result, pl.DataFrame)
+        result = cast(pl.DataFrame, pl.scan_delta(store).select("file_path").collect())
         return set(result["file_path"].to_list())
     except Exception:
         return set()
@@ -68,8 +84,7 @@ def _save_watermark(store: str, paths: list[str]) -> None:
 def _load_delta_watermark(store: str) -> int | None:
     """Return the last processed Delta source version, or ``None`` on first run."""
     try:
-        result = pl.scan_delta(store).select(pl.col("version").max()).collect()
-        assert isinstance(result, pl.DataFrame)
+        result = cast(pl.DataFrame, pl.scan_delta(store).select(pl.col("version").max()).collect())
         val = result["version"][0]
         return int(val) if val is not None else None
     except Exception:
@@ -162,8 +177,7 @@ def _sink_target(
 
     if not keys:
         if first_write:
-            _df = lf.collect()
-            assert isinstance(_df, pl.DataFrame)
+            _df = cast(pl.DataFrame, lf.collect())
             write_deltalake(
                 target,
                 _df.to_arrow(),
@@ -177,8 +191,7 @@ def _sink_target(
             lf.sink_delta(target, mode="append")
         return
 
-    _df = lf.collect(engine="streaming")
-    assert isinstance(_df, pl.DataFrame)
+    _df = cast(pl.DataFrame, lf.collect(engine="streaming"))
 
     if first_write:
         write_deltalake(
@@ -237,7 +250,7 @@ def incremental(
         history_target:  History table path. Required when ``scd_type=4``.
         compact_every:   Run compaction every N successful runs. ``None`` to disable.
         compute_context: ``polars_cloud.ComputeContext`` for remote execution.
-        staging:         S3 staging path. Required when ``compute_context`` is set.
+        staging:         Unused. Kept for backwards compatibility.
         reader_kwargs:   Forwarded to the file scanner.
         concat_options:  Forwarded to ``pl.concat``.
 
@@ -372,15 +385,12 @@ class IncrementalPipeline:
 
         Raises:
             ValueError: If ``scd_type=4`` and ``history_target`` is not set.
-            ValueError: If ``compute_context`` is set and ``staging`` is not.
             ValueError: If ``merge_on`` is an empty list.
         """
         if isinstance(merge_on, list) and len(merge_on) == 0:
             raise ValueError("merge_on must not be an empty list")
         if scd_type == 4 and history_target is None:
             raise ValueError("history_target is required when scd_type=4")
-        if compute_context is not None and staging is None:
-            raise ValueError("staging is required when compute_context is set")
 
         self.fn = fn
         self.source = source
@@ -416,15 +426,21 @@ class IncrementalPipeline:
         processed = _load_watermark(self.watermark_store)
         all_files: list[str] = []
         for src in self._sources:
-            all_files.extend(_list_local_files(src, self._suffixes))
+            if src.startswith("s3://"):
+                all_files.extend(_list_s3_files(src, self._suffixes))
+            else:
+                all_files.extend(_list_local_files(src, self._suffixes))
         return sorted(p for p in all_files if p not in processed)
 
     def _scan_new(self, new_files: list[str]) -> list[pl.LazyFrame]:
         """Return one LazyFrame per source directory that has files in *new_files*."""
         frames: list[pl.LazyFrame] = []
         for src in self._sources:
-            src_root = str(Path(src).resolve())
-            src_files = [f for f in new_files if f.startswith(src_root)]
+            if src.startswith("s3://"):
+                src_prefix = src.rstrip("/") + "/"
+            else:
+                src_prefix = str(Path(src).resolve())
+            src_files = [f for f in new_files if f.startswith(src_prefix)]
             if src_files:
                 frames.append(
                     _scan_files(
@@ -462,13 +478,11 @@ class IncrementalPipeline:
         if self.compute_context is not None:
             from .cloud import _sink_target_remote  # noqa: PLC0415
 
-            assert self.staging is not None
             _sink_target_remote(
                 self.target,
                 result_lf,
                 self.merge_on,
                 self.compute_context,
-                self.staging,
                 self.partition_by,
             )
         elif self.scd_type == 2:
@@ -553,8 +567,7 @@ class IncrementalPipeline:
 
     def status(self) -> pl.DataFrame:
         """Return the watermark table as an eager DataFrame."""
-        result = pl.scan_delta(self.watermark_store).collect()
-        assert isinstance(result, pl.DataFrame)
+        result = cast(pl.DataFrame, pl.scan_delta(self.watermark_store).collect())
         return result
 
     def maintain(

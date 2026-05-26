@@ -126,19 +126,6 @@ def test_incremental_scd_type_4_requires_history_target():
             return lf
 
 
-def test_incremental_compute_context_requires_staging():
-    """Test that compute_context requires staging."""
-    with pytest.raises(ValueError, match="staging"):
-
-        @incremental(
-            source="/tmp/input/",
-            target="/tmp/output/",
-            compute_context=object(),
-        )
-        def test_pipeline(lf: pl.LazyFrame) -> pl.LazyFrame:
-            return lf
-
-
 def test_incremental_decorator():
     """Test that the incremental decorator creates an IncrementalPipeline."""
 

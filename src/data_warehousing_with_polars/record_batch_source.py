@@ -18,7 +18,7 @@ to need updating as the Polars IO plugin API evolves.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Generator, cast
 
 import polars as pl
 from polars.io.plugins import register_io_source
@@ -49,8 +49,7 @@ def make_lazy(reader: "pa.RecordBatchReader") -> pl.LazyFrame:
         be planned without reading any data.
     """
 
-    _schema_frame = pl.from_arrow(reader.schema.empty_table())
-    assert isinstance(_schema_frame, pl.DataFrame)
+    _schema_frame = cast(pl.DataFrame, pl.from_arrow(reader.schema.empty_table()))
     polars_schema = _schema_frame.schema
 
     def _source_gen(
@@ -65,8 +64,7 @@ def make_lazy(reader: "pa.RecordBatchReader") -> pl.LazyFrame:
                 batch = reader.read_next_batch()
             except StopIteration:
                 return
-            _batch_df = pl.from_arrow(batch)
-            assert isinstance(_batch_df, pl.DataFrame)
+            _batch_df = cast(pl.DataFrame, pl.from_arrow(batch))
             df = _batch_df
             if with_columns is not None:
                 present = [c for c in with_columns if c in df.columns]
