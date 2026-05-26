@@ -117,8 +117,9 @@ def _transform(df: pl.DataFrame, source_path: str) -> pl.DataFrame:
     natural keys ensures the Delta table stays clean regardless.
     """
     now = datetime.now(timezone.utc)
-    return (
-        df.lazy()
+    result = (
+        df
+        .lazy()
         .filter(pl.col("MONAT") != "Summe")
         .with_columns(
             pl.col("MONAT").str.strptime(pl.Date, "%Y%m", strict=False).alias("date"),
@@ -128,6 +129,8 @@ def _transform(df: pl.DataFrame, source_path: str) -> pl.DataFrame:
         .unique(subset=_NATURAL_KEYS, keep="last", maintain_order=False)
         .collect()
     )
+    assert isinstance(result, pl.DataFrame)
+    return result
 
 
 # ── Watermark helpers ─────────────────────────────────────────────────────────
@@ -136,9 +139,9 @@ def _transform(df: pl.DataFrame, source_path: str) -> pl.DataFrame:
 def _already_processed(watermark_store: str, stamp: str) -> bool:
     """Return True if *stamp* (YYYYMM) is recorded in the watermark table."""
     try:
-        stamps = (
-            pl.scan_delta(watermark_store).select("stamp").collect()["stamp"].to_list()
-        )
+        collected = pl.scan_delta(watermark_store).select("stamp").collect()
+        assert isinstance(collected, pl.DataFrame)
+        stamps = collected["stamp"].to_list()
         return stamp in stamps
     except Exception:
         return False
@@ -176,7 +179,9 @@ def _ingest(name: str, target: str) -> int:
 
     csv_path = _download(name)
 
-    df_raw = pl.read_csv(str(csv_path), schema_overrides=SCHEMA_MONATSZAHLEN, null_values=["NA"], quote_char='"')
+    df_raw = pl.read_csv(
+        str(csv_path), schema_overrides=SCHEMA_MONATSZAHLEN, null_values=["NA"], quote_char='"'
+    )
     logger.info("[%s] Raw CSV: %d rows.", name, len(df_raw))
 
     df = _transform(df_raw, str(csv_path))
@@ -249,10 +254,10 @@ def _download(name: str) -> Path:
 def main() -> None:
     for name, suffix in [
         ("accidents", "munich_accidents"),
-        ("airport",   "munich_airport"),
-        ("vehicles",  "munich_vehicles"),
-        ("tourism",   "munich_tourism"),
-        ("labor",     "munich_labor"),
+        ("airport", "munich_airport"),
+        ("vehicles", "munich_vehicles"),
+        ("tourism", "munich_tourism"),
+        ("labor", "munich_labor"),
     ]:
         target = f"s3://{BUCKET}/delta/{suffix}"
         n = _ingest(name, target)
@@ -261,5 +266,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

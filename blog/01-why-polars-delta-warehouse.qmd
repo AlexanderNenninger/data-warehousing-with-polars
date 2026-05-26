@@ -10,39 +10,256 @@ Most teams want three things from a warehouse pipeline:
 
 This project combines [Polars](https://pola.rs) and [Delta Lake](https://delta.io) to deliver exactly that with a small Python API. Instead of building pipeline state tracking, merge logic, and table maintenance from scratch, you define a transformation once and let the library orchestrate the operational pieces.
 
-## The core idea
+## What this is not
 
-You write a function that maps `LazyFrame -> LazyFrame` and decorate it with [`@incremental`](../reference/incremental.incremental.qmd):
+A fully-fledged warehouse engine — Snowflake, BigQuery, Redshift, Databricks — bundles storage,
+compute, a SQL query engine, a metadata catalog, access controls, and a managed scheduler into
+one product.
+You pay per query or per warehouse-hour, and the vendor handles reliability, scaling, and
+upgrades.
+That model is the right choice when a team needs a self-service SQL layer, fine-grained
+column-level access control, or BI tool integrations that expect a JDBC endpoint.
+
+This library is something narrower: **a thin orchestration layer on top of Polars and Delta
+Lake that you run yourself**.
+It has no catalog, no SQL interface, no built-in scheduler, and no managed infrastructure.
+You bring your own storage (a local path, S3, or GCS), your own compute (a Python process or
+a Polars Cloud cluster), and your own orchestrator (a cron job, Airflow, or a GitHub Actions
+workflow).
+In exchange you get no per-query cost, no vendor lock-in, and full access to the Polars API
+everywhere in the pipeline.
+
+This makes it a practical fit for teams that already run Python, control their own storage
+layer, and want incremental ingestion with Delta semantics without adopting a full managed
+platform.
+
+## The problem with re-reading everything
+
+A common pattern in data engineering is a **landing zone**: an S3 prefix (or a local directory)
+where upstream systems drop Parquet files as they arrive.
+A sensor exports a batch every hour.
+A partner ships a daily extract.
+A CDC tool writes one file per micro-batch.
+The files accumulate and your job is to load them into a clean, queryable table.
+
+Suppose you receive Parquet files in a directory and want to load them into a Delta table.
+The obvious approach is to re-read the whole directory every time:
 
 ```python
-from data_warehousing_with_polars import incremental
 import polars as pl
+from deltalake import write_deltalake
 
-@incremental(source="/data/uploads", target="/data/delta/users", merge_on="id")
-def users(lf: pl.LazyFrame) -> pl.LazyFrame:
-    return lf.filter(pl.col("is_deleted") == False)
+def run():
+    lf = pl.scan_parquet("/data/uploads/*.parquet")
+    write_deltalake("/data/delta/users", lf.collect(), mode="overwrite")
 ```
 
-From there, `.run()` handles:
+This works once.
+On the second run you overwrite data you already wrote.
+By the tenth run you have scanned the same gigabytes ten times and the table contains exactly
+what was in the last batch — which is rarely what you want.
 
-- discovering new input files,
-- skipping already processed files,
-- writing to Delta,
-- upserting on key when `merge_on` is provided,
-- and persisting ingest state for the next run.
+## Track what you have already seen
 
-## Why this can replace heavier stacks for many use cases
+The fix is to remember which files were already processed.
+This record is called a **watermark** — a persistent marker that separates
+"already ingested" from "not yet ingested".
 
-For small-to-medium pipelines, you often do not need Spark clusters, a separate orchestration DSL, and a separate warehouse modeling layer just to load and maintain clean Delta tables. The library already gives you:
+The simplest possible watermark is a table with one row per processed file and a timestamp
+recording when it was ingested.
+Before each run you load that table into a set of known paths.
+After a successful run you append the newly processed paths to it.
+On the next run, any file whose path is already in the set is skipped.
 
-- watermark-based incremental processing,
-- SCD Type 1/2/4 semantics,
-- schema validation at ingestion boundaries,
-- compaction and vacuum hooks for table health.
+A Delta table is a natural place to keep this state.
+It lives on the same storage layer as your target table, it survives process restarts,
+and you can inspect or query it like any other table if something goes wrong.
 
-That means your transformation functions stay focused on business logic rather than warehouse plumbing.
+```python
+import polars as pl
+from datetime import datetime, timezone
+from deltalake import write_deltalake
 
-## Hello-world incremental upsert
+def _load_watermark(store: str) -> set[str]:
+    try:
+        result = pl.scan_delta(store).select("file_path").collect()
+        return set(result["file_path"].to_list())
+    except Exception:          # table doesn't exist yet on first run
+        return set()
+
+def _save_watermark(store: str, paths: list[str]) -> None:
+    rows = pl.DataFrame({
+        "file_path": paths,
+        "ingested_at": [datetime.now(timezone.utc)] * len(paths),
+    })
+    write_deltalake(store, rows, mode="append")
+```
+
+Notice that `_load_watermark` catches all exceptions and returns an empty set.
+That handles the first-run case where the watermark table does not exist yet,
+without requiring any special initialisation step.
+
+A run function that uses these helpers looks like:
+
+```python
+from pathlib import Path
+from deltalake import DeltaTable, write_deltalake
+from deltalake.exceptions import TableNotFoundError
+
+def run(source: str, target: str, watermark: str):
+    processed = _load_watermark(watermark)
+    new_files = sorted(
+        str(p) for p in Path(source).rglob("*.parquet")
+        if str(p) not in processed
+    )
+
+    if not new_files:
+        return []                         # nothing to do
+
+    lf = pl.scan_parquet(new_files)
+
+    try:                                  # append to existing table …
+        DeltaTable(target)
+        lf.sink_delta(target, mode="append")
+    except TableNotFoundError:            # … or create it on first write
+        write_deltalake(target, lf.collect(), mode="overwrite")
+
+    _save_watermark(watermark, new_files)
+    return new_files
+```
+
+Two things are worth pointing out here.
+
+First, the first-write branch.
+`DeltaTable(target)` raises `TableNotFoundError` when the table does not exist yet.
+We catch that and fall back to `write_deltalake(..., mode="overwrite")`, which creates the table.
+On every subsequent run the `try` block succeeds and we just append.
+
+Second, the ordering of write and watermark save.
+The watermark is saved *after* the write completes successfully.
+If the process crashes between the write and the watermark save, the next run will re-process
+those files and append them again — a duplicate, not a gap.
+This is the standard **at-least-once** guarantee: you may see a row more than once,
+but you will never silently drop one.
+For append tables that is usually acceptable.
+For entity tables with a unique key, the upsert in the next section makes duplicates harmless.
+
+## Adding upsert semantics
+
+Append-only is fine for event logs, where every row is a distinct event and duplicates do not matter.
+For entity tables — customers, products, device state — each key should appear exactly once
+in the table and later batches should update the existing row rather than add another one.
+
+Delta Lake supports this through its merge operation.
+You provide a **predicate** that identifies which rows in the target table match rows in the
+incoming data (e.g. `t.id = s.id`), then declare what to do with matches and non-matches.
+`when_matched_update_all` replaces every column of the matched target row with the source values.
+`when_not_matched_insert_all` inserts rows from the source that had no match in the target.
+Together, those two clauses implement a standard upsert.
+
+```python
+def _upsert(target: str, lf: pl.LazyFrame, merge_on: list[str]) -> None:
+    df = lf.collect()
+    predicate = " AND ".join(f"t.{k} = s.{k}" for k in merge_on)
+    (
+        DeltaTable(target)
+        .merge(df.to_arrow(), predicate, source_alias="s", target_alias="t")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .execute()
+    )
+```
+
+The predicate is built from the `merge_on` columns at runtime.
+A single-column key like `"id"` produces `t.id = s.id`.
+A composite key like `["region", "id"]` produces `t.region = s.region AND t.id = s.id`.
+
+The run function then branches on whether `merge_on` is supplied:
+
+```python
+def run(source, target, watermark, merge_on=None):
+    ...
+    keys = [merge_on] if isinstance(merge_on, str) else (merge_on or [])
+    if keys:
+        _upsert(target, lf, keys)
+    else:
+        lf.sink_delta(target, mode="append")
+    ...
+```
+
+With upsert in place, the at-least-once duplicate concern from the previous section is resolved:
+re-processing a file that was already written just produces identical merge matches,
+and the table ends up in the same state as if the file had been processed only once.
+
+## Wrapping it in a decorator
+
+At this point the `run` function works correctly, but it has a design problem: every call site
+has to pass `source`, `target`, `watermark`, and `merge_on` explicitly, even though those
+values never change between runs.
+The only input that varies is the data itself — i.e. which new files happen to be waiting.
+
+A Python decorator is the natural way to separate static configuration from the per-run logic.
+The decorator captures `source`, `target`, and the rest at definition time and stores them
+in a `Pipeline` object.
+The object's `.run()` method then uses those stored values each time it is called.
+
+There is one more thing the decorator can do: provide a default watermark path.
+Rather than requiring callers to choose a storage location for their watermark table,
+we can derive one automatically from the target path by appending `/.watermark`.
+That keeps the watermark co-located with the data it describes
+and means callers only have to think about it if they have a reason to override it.
+
+```python
+from typing import Callable
+
+def incremental(source, target, merge_on=None, watermark_store=None):
+    _wm = watermark_store or target.rstrip("/") + "/.watermark"
+
+    def decorator(fn: Callable) -> "Pipeline":
+        return Pipeline(fn, source, target, merge_on, _wm)
+
+    return decorator
+
+
+class Pipeline:
+    def __init__(self, fn, source, target, merge_on, watermark):
+        self.fn = fn
+        self.source, self.target = source, target
+        self.merge_on, self.watermark = merge_on, watermark
+
+    def run(self):
+        processed = _load_watermark(self.watermark)
+        new_files = sorted(
+            str(p) for p in Path(self.source).rglob("*.parquet")
+            if str(p) not in processed
+        )
+        if not new_files:
+            return []
+
+        result_lf = self.fn(pl.scan_parquet(new_files))   # apply user transform
+
+        keys = [self.merge_on] if isinstance(self.merge_on, str) else (self.merge_on or [])
+        try:
+            DeltaTable(self.target)
+            if keys:
+                _upsert(self.target, result_lf, keys)
+            else:
+                result_lf.sink_delta(self.target, mode="append")
+        except TableNotFoundError:
+            write_deltalake(self.target, result_lf.collect(), mode="overwrite")
+
+        _save_watermark(self.watermark, new_files)
+        return new_files
+```
+
+The `self.fn(pl.scan_parquet(new_files))` line is where the user's transformation runs.
+The `Pipeline` object never calls the function directly — it scans the new files into a
+`LazyFrame`, passes that to the function, and receives back a transformed `LazyFrame`.
+No data is collected into memory until the write step.
+This means the transformation code you write only needs to express the business logic;
+the orchestration (file discovery, watermark, write strategy) happens around it.
+
+Usage is now the one-liner you saw at the top:
 
 ```python
 from data_warehousing_with_polars import incremental
@@ -55,10 +272,32 @@ def clean_customers(lf: pl.LazyFrame) -> pl.LazyFrame:
           .filter(pl.col("customer_id").is_not_null())
     )
 
-clean_customers.run()
+clean_customers.run()   # idempotent — safe to call on a schedule
 ```
 
-On the first run, the target table is created. On later runs, only unseen files are processed, and matching keys are updated in-place (SCD Type 1 behavior).
+On the first run, the target table is created and all files in `/data/raw/customers` are processed.
+On later runs, only files that have not appeared in the watermark are picked up.
+Calling `clean_customers.run()` when there are no new files returns an empty list immediately
+without touching the target table at all.
+
+## What the full library adds on top
+
+The sketch above is roughly 60 lines and handles the common case well.
+The production [`@incremental`](../reference/incremental.incremental.qmd) extends it
+along the same lines — more configuration in the decorator, `.run()` stays a single method call.
+
+| Concern | Sketch | Library |
+|---|---|---|
+| File formats | Parquet only | Parquet, CSV, NDJSON, Delta CDF |
+| Sources | Single directory | List of directories (fan-in) |
+| SCD | Type 1 only | Type 1, 2, 4 |
+| Remote execution | Local only | Polars Cloud via `compute_context` |
+| Table health | None | `compact_every`, `maintain()`, `vacuum()` |
+| Dry run / status | None | `dry_run=True`, `.status()`, `.reset()` |
+
+The rest of this series covers each row in that table in turn.
+The sketches in the posts ahead follow the same pattern: start from what breaks, build the
+minimal fix, then show where the library takes it further.
 
 ## What this series covers next
 

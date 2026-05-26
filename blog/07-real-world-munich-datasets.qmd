@@ -1,51 +1,108 @@
 ---
-title: Real-World Example — Six Munich Open Datasets
+title: Real-World Example — Munich Open Datasets
 ---
 
-The best way to understand the framework is through the six Munich examples included in this project:
+The best way to understand a framework is to see it applied to real data with real quirks.
+The Munich examples in this project are drawn from the city's open data portal and cover
+two distinct ingestion patterns that come up frequently in production:
 
-- traffic accidents,
-- airport traffic,
-- cycling counters,
-- EV registrations,
-- labor indicators,
-- tourism metrics.
+- **Monatszahlen** — monthly statistical indicators published as snapshot CSVs that are
+  republished in full each time new data arrives,
+- **cycling counters** — 15-minute interval counts from permanent counting stations,
+  delivered as cumulative Parquet exports.
 
-## Common end-to-end pattern
+These two datasets exercise different parts of the library and surface different operational
+considerations.
 
-Each example follows the same architecture:
+## Monatszahlen: snapshot-replacement ingestion
 
-1. load external public source files,
-2. validate/shape data with `@schema` and Polars transforms,
-3. persist curated Delta tables via `@incremental`,
-4. build visual analysis in Quarto + Altair.
+The Monatszahlen dataset covers monthly figures across several Munich statistical categories —
+labor, tourism, traffic, and others.
+The city portal republishes the full CSV for each category every month, not just the new rows.
+That means the same historical rows appear in every delivery.
 
-This repeatable flow is exactly what you want in production data warehousing: one consistent contract from raw ingestion to analytical consumption.
+This is the classic **snapshot-replacement** pattern.
+A naive append would duplicate every historical row on every run.
+The pipeline handles it by using `merge_on` with a composite natural key and adding a
+deduplication step inside the transform:
 
-## Snapshot-replacement vs append-only inputs
+```python
+@incremental(
+    source=source_path,
+    target=target_path,
+    merge_on=["MONATSZAHL", "AUSPRAEGUNG", "MONAT"],
+)
+def ingest(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return (
+        lf.filter(pl.col("MONAT") != "Summe")       # drop annual summary rows
+          .with_columns(
+              pl.col("MONAT").str.strptime(pl.Date, "%Y%m").alias("date"),
+          )
+          .unique(subset=["MONATSZAHL", "AUSPRAEGUNG", "MONAT"], keep="last")
+    )
+```
 
-The examples are especially useful because they include snapshot-style datasets (where suppliers republish full files) and naturally additive series.
+The `unique()` call handles duplicate rows within a single delivery.
+The `merge_on` handles the case where a row from a previous delivery appears again in the
+current one — the merge finds the existing row by key and updates it in-place rather than
+inserting a second copy.
 
-With watermarking and merge semantics, both source behaviors can be handled without rewriting pipeline architecture.
+The pipeline also maintains a separate **month-stamp watermark** (`_already_processed`) to
+skip months that have not changed since the last run, avoiding unnecessary merge operations
+even when the source file is new.
 
-## Cloud storage in practice
+## Cycling counters: append-only time series
 
-Examples are configured to read/write Delta tables using environment-driven bucket paths. This keeps notebooks portable across local runs, CI, and cloud storage backends.
+The cycling counter dataset records 15-minute bicycle counts at stations around the city.
+New intervals are simply appended — historical rows never change.
+This is a straightforward append-only pipeline with no merge key:
 
-## Lessons learned from the collection
+```python
+@incremental(source=source_path, target=target_path)
+def ingest(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf.with_columns(
+        pl.col("datum_uhrzeit").str.to_datetime().alias("ts"),
+    )
+```
 
-Across the six datasets, a few operational lessons repeat:
+Without `merge_on`, every run appends the new rows and leaves existing rows untouched.
+The watermark ensures each source file is read exactly once.
 
-- choose partition columns based on query filters, not source shape,
-- allow controlled schema evolution where source owners change formats,
-- keep reset workflows explicit for backfills and historical corrections,
-- and apply maintenance regularly to preserve read performance.
+## Lessons from both pipelines
+
+A few operational patterns repeated across both examples:
+
+**Choose `merge_on` based on source behavior, not table shape.**
+The Monatszahlen pipeline needs a merge key because the source republishes old rows.
+The cycling pipeline does not because the source is purely additive.
+Getting this wrong in either direction produces either duplicates (no key on a snapshot source)
+or unnecessary merge overhead (key on an additive source).
+
+**Partition on query filters, not source shape.**
+Both pipelines partition by a date-derived column — by month for Monatszahlen, by date for
+cycling.
+The partitioning reflects how analysts will filter the data, not how the source delivers it.
+
+**Allow schema evolution where source owners drift.**
+The Monatszahlen CSV format has changed column names and types over the years.
+Using `evolution="cast"` in `@schema` absorbs those changes without failing the pipeline,
+while still rejecting genuinely broken deliveries.
+
+**Keep reset workflows explicit for backfills.**
+When the transform logic changes — a new derived column, a corrected date parse — calling
+`pipeline.reset()` followed by `pipeline.run()` reprocesses all historical files and
+rebuilds the target table cleanly.
+This is safer than trying to apply a partial fix to the existing table.
 
 ## Where to go next
 
-After walking through these examples, a natural next step is to replicate the same pattern on your own domain data:
+After walking through these examples, the natural next step is to apply the same pattern
+to your own domain data.
+The decisions are always the same four:
 
-- land raw files in a stable path,
-- codify transform + schema contracts,
-- select SCD strategy per entity,
-- and automate maintenance as part of platform operations.
+1. What is the source delivery pattern — snapshot-replacement or append-only?
+2. What is the natural key for merges, if any?
+3. Which columns are stable enough to partition on?
+4. How strict should schema validation be, and where should failures go?
+
+The library handles the operational plumbing once those decisions are made.

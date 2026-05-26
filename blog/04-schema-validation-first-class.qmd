@@ -2,57 +2,276 @@
 title: Schema Validation as a First-Class Concern
 ---
 
-Bad source schemas are one of the fastest ways to corrupt downstream warehouse tables. This project treats schema validation as a dedicated ingestion-layer concern through [`@schema`](../reference/schema.schema.qmd).
+Bad source schemas are one of the fastest ways to corrupt downstream warehouse tables.
+A partner adds a column.
+An upstream team changes a field from `Int64` to `String` without telling anyone.
+A sensor omits a field when it has nothing to report.
+Without explicit handling, any of these quietly pollute your Delta table or raise a cryptic
+Polars type error halfway through a transform that has already committed some rows.
+
+This project treats schema validation as a dedicated ingestion-layer concern through
+[`@schema`](../reference/schema.schema.qmd).
+This post builds a minimal version of that decorator step by step.
 
 ## Why validate at ingestion boundaries
 
-If you defer schema checks until late in the pipeline, invalid batches can already contaminate Delta tables and force expensive cleanup. Validating at the transform boundary prevents that drift from propagating.
+Schema problems are cheapest to catch before any data has been written.
+If you defer schema checks until later — inside the transform, or worse, in a downstream
+query — a bad batch may already be in the Delta table.
+Removing it requires identifying exactly which rows came from which file, rewriting the table,
+and reconciling the watermark.
+That is expensive and error-prone.
 
-## How `@schema` composes
+Validating at the ingestion boundary means a bad batch either raises an error, gets silently
+dropped, or gets routed to a quarantine table before it touches the target.
+The target table only ever contains data that passed the schema contract.
 
-`@schema` wraps a `LazyFrame -> LazyFrame` function directly and composes naturally under `@incremental`. It can also be used standalone outside incremental ingestion.
+## Step 1: intercept and inspect
 
-That keeps schema policy decoupled from file listing, watermark logic, and write semantics.
+A schema validator is a function wrapper.
+It sits between the caller (the pipeline) and the transform (your business logic).
+The minimal version intercepts the `LazyFrame`, checks the column names and types, and either
+lets it through or raises.
 
-## Three policy dimensions
+Polars provides `lf.collect_schema()` for exactly this — it returns a `{name: dtype}` mapping
+by reading file metadata, without touching a single row:
 
-1. **Missing expected columns (`on_missing`)**
-   - `raise`
-   - `drop`
-   - `quarantine`
+```python
+def validate(lf: pl.LazyFrame, expect: dict) -> pl.LazyFrame:
+    actual = lf.collect_schema()
+    for col, dtype in expect.items():
+        if col not in actual:
+            raise ValueError(f"column {col!r} is missing (expected {dtype})")
+        if actual[col] != dtype:
+            raise ValueError(f"column {col!r}: expected {dtype}, got {actual[col]}")
+    return lf
+```
 
-2. **Unexpected extra columns (`on_extra`)**
-   - `ignore`
-   - `raise`
-   - `drop`
+Wrapping this as a decorator that can be applied to any `LazyFrame → LazyFrame` function:
 
-3. **Type mismatches (`evolution`)**
-   - `strict`
-   - `cast`
-   - `merge`
+```python
+from functools import wraps
 
-Together these allow strict contracts for critical tables and controlled evolution for sources that drift.
+def schema(expect: dict):
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(lf: pl.LazyFrame) -> pl.LazyFrame:
+            actual = lf.collect_schema()
+            for col, dtype in expect.items():
+                if col not in actual:
+                    raise ValueError(f"column {col!r} is missing")
+                if actual[col] != dtype:
+                    raise ValueError(f"column {col!r}: expected {dtype}, got {actual[col]}")
+            return fn(lf)
+        return wrapper
+    return decorator
+```
 
-## Quarantine pattern
+This already works as a standalone validator on any function:
 
-When configured with `on_missing="quarantine"`, rejected batches are written to a quarantine Delta table and annotated with:
+```python
+@schema(expect={"device_id": pl.Int64, "temp_c": pl.Float64})
+def transform(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf.filter(pl.col("temp_c") > 0)
+```
 
-- `_violations` (JSON details),
-- `_quarantined_at` timestamp.
+## Step 2: structured violation records
 
-This gives operations teams a concrete backlog of bad batches to inspect and replay.
+Raising a generic `ValueError` is functional but makes it harder to programmatically inspect
+what went wrong.
+Before adding policy options, it helps to introduce a structured `SchemaViolation` record:
+
+```python
+class SchemaViolation:
+    def __init__(self, column, issue, expected=None, actual=None):
+        self.column = column    # column name
+        self.issue = issue      # "missing", "type_mismatch", or "extra"
+        self.expected = expected
+        self.actual = actual
+
+class SchemaError(Exception):
+    def __init__(self, violations: list[SchemaViolation]):
+        self.violations = violations
+        lines = [f"  {v.column!r}: {v.issue}" for v in violations]
+        super().__init__("Schema validation failed:\n" + "\n".join(lines))
+```
+
+Now the validation loop collects all violations before deciding what to do,
+rather than raising on the first problem:
+
+```python
+violations = []
+for col, dtype in expect.items():
+    if col not in actual:
+        violations.append(SchemaViolation(col, "missing", str(dtype)))
+    elif actual[col] != dtype:
+        violations.append(SchemaViolation(col, "type_mismatch", str(dtype), str(actual[col])))
+
+if violations:
+    raise SchemaError(violations)
+```
+
+The caller can now catch `SchemaError` and iterate over `e.violations` to log or route each
+problem individually.
+
+## Step 3: missing-column policy (`on_missing`)
+
+Not every violation warrants a hard stop.
+Sources sometimes legitimately omit optional fields, or you want to capture bad batches for
+later inspection rather than crashing the pipeline.
+
+An `on_missing` parameter with three options handles this:
+
+```python
+def wrapper(lf: pl.LazyFrame) -> pl.LazyFrame:
+    ...
+    missing = [v for v in violations if v.issue == "missing"]
+    if missing:
+        if on_missing == "raise":
+            raise SchemaError(missing)
+        elif on_missing == "quarantine":
+            _write_quarantine(lf, missing, quarantine_path)   # see below
+        # "drop" or after quarantine write: skip this batch
+        return pl.LazyFrame()
+    ...
+```
+
+`"drop"` and `"quarantine"` both return an empty `LazyFrame`.
+From the pipeline's perspective the batch produced zero rows and the watermark advances
+normally — the target table is not touched.
+The difference is that `"quarantine"` first persists the raw batch somewhere for forensics.
+
+## Step 4: extra-column policy (`on_extra`)
+
+When a source adds a column that was not declared in `expect`, the options are:
+
+```python
+extra = [v for v in violations if v.issue == "extra"]
+if extra:
+    if on_extra == "raise":
+        raise SchemaError(extra)
+    elif on_extra == "drop":
+        lf = lf.drop([v.column for v in extra])
+    # "ignore": pass extra columns through unchanged
+```
+
+One important exemption: columns injected by the library itself (`_source_file`,
+`_ingested_at`) start with `_` by convention and should never be flagged as extra.
+Add the detection loop only for non-underscore columns:
+
+```python
+for col in actual:
+    if col.startswith("_"):
+        continue   # library-injected column, always exempt
+    if col not in expect:
+        violations.append(SchemaViolation(col, "extra"))
+```
+
+## Step 5: type-mismatch policy (`evolution`)
+
+The default is to raise on any type mismatch (`evolution="strict"`).
+But real data sources drift: a field shipped as `Int32` is now `Int64`, or an integer arrives
+as `String` from a loosely typed CSV exporter.
+
+Two lenient modes handle this with Polars' `.cast()`:
+
+```python
+type_violations = [v for v in violations if v.issue == "type_mismatch"]
+if type_violations:
+    if evolution == "strict":
+        raise SchemaError(type_violations)
+    # "cast" or "merge": attempt a Polars cast to the declared type
+    for v in type_violations:
+        lf = lf.with_columns(pl.col(v.column).cast(expect[v.column]))
+```
+
+The cast is lazy — it only executes when data is collected downstream.
+If the cast is unsafe (e.g. a `String` column containing `"abc"` being cast to `Int64`),
+Polars raises at materialisation time, which the pipeline's error handling will surface.
+
+`"merge"` semantics (widening only) are enforced by the same cast path in the library
+implementation — the distinction only matters when the expected type is narrower than the
+actual type, in which case `"merge"` would still raise.
+
+## Step 6: the quarantine write
+
+When `on_missing="quarantine"` triggers, the library collects the rejected batch, appends
+two bookkeeping columns, and writes it to a quarantine Delta table:
+
+```python
+import json
+from datetime import datetime, timezone
+from deltalake import write_deltalake
+
+def _write_quarantine(lf, violations, store):
+    if store is None:
+        return   # no quarantine path configured, drop silently
+    df = lf.collect()
+    df = df.with_columns(
+        pl.lit(json.dumps([v.to_dict() for v in violations])).alias("_violations"),
+        pl.lit(datetime.now(timezone.utc)).alias("_quarantined_at"),
+    )
+    write_deltalake(store, df.to_arrow(), mode="append")
+```
+
+The quarantine table is append-only.
+Every rejected batch is preserved in full with a JSON violation report:
+
+```json
+[{"column": "temp_c", "issue": "missing", "expected": "Float64", "actual": null}]
+```
+
+Operations teams can query the quarantine table to see which batches were rejected,
+what the violations were, and replay them once the source is corrected.
+
+If `quarantine=None`, batches that trigger `on_missing="quarantine"` are still dropped
+silently — useful during development when no quarantine path is configured yet.
+
+## The complete decorator signature
+
+Assembling all six steps gives the full `@schema` signature:
+
+```python
+@schema(
+    expect={"device_id": pl.Int64, "temp_c": pl.Float64, "recorded_at": pl.Datetime("us", "UTC")},
+    on_missing="quarantine",   # "raise" | "drop" | "quarantine"
+    on_extra="drop",           # "ignore" | "raise" | "drop"
+    evolution="cast",          # "strict" | "cast" | "merge"
+    quarantine="/data/delta/bad_readings",
+)
+def readings(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf.filter(pl.col("temp_c").is_between(-50, 100))
+```
+
+## Composing with `@incremental`
+
+The typical production pattern stacks `@schema` as the inner decorator under `@incremental`.
+`@incremental` scans the new files and calls the decorated function with the resulting
+`LazyFrame`. `@schema` intercepts that call, checks the schema, and either passes the frame
+through (possibly modified) or handles the violation before the transform ever runs:
+
+```python
+@incremental(source="/data/uploads/", target="/data/delta/readings", merge_on="device_id")
+@schema(
+    expect={"device_id": pl.Int64, "temp_c": pl.Float64, "recorded_at": pl.Datetime("us", "UTC")},
+    on_missing="quarantine",
+    on_extra="drop",
+    evolution="cast",
+    quarantine="/data/delta/bad_readings",
+)
+def readings(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf.filter(pl.col("temp_c").is_between(-50, 100))
+```
+
+`@schema` can also be used standalone on any `LazyFrame → LazyFrame` function, outside any
+incremental pipeline.
 
 ## Lazy-first design
 
-Validation inspects schema metadata first (`collect_schema`) and avoids materializing rows unless quarantine handling requires writing the rejected batch. So happy-path execution stays lazy.
+Schema validation uses `lf.collect_schema()` to inspect column names and types.
+This is a metadata operation — no rows are read.
+The happy path (schema passes) stays fully lazy from file scan through transform to Delta write.
 
-## Example: Munich accidents pipeline
-
-The Munich accidents example demonstrates the exact production pattern:
-
-- expected schema declared,
-- missing fields quarantined,
-- extra fields dropped,
-- controlled type casts for evolution.
-
-That balances reliability with real-world source variability.
+The only time data is materialised inside `@schema` is when `on_missing="quarantine"` triggers:
+the rejected batch is collected so it can be written to the quarantine table.
+Even then, only the bad batch is collected, not the entire run.

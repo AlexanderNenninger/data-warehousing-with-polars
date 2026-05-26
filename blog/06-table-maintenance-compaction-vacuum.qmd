@@ -2,44 +2,99 @@
 title: Table Maintenance — Compaction, Z-Ordering, and Vacuuming
 ---
 
-Incremental writes are great for freshness, but they naturally create many small files over time. Without maintenance, read performance degrades and storage costs drift upward.
+Incremental writes are great for freshness, but they have a structural side effect: every
+`sink_delta` append or merge call creates new Parquet files in the table directory.
+A table that is ingested hourly will accumulate hundreds of small files per day.
+A query engine reading that table has to open, read metadata from, and potentially scan each
+of those files separately.
+Over time, this degrades query performance and inflates storage costs.
 
-This project exposes table maintenance directly via `maintain()` and optional `compact_every` scheduling.
+This project exposes table maintenance directly via `maintain()` and optional `compact_every`
+scheduling built into the pipeline.
 
-## Why maintenance is necessary
+## What compaction does
 
-Frequent appends and merges fragment table layout. Query engines then scan more files and metadata than necessary. Compaction and Z-ordering restore read efficiency.
+Compaction reads all the small files in a table partition and rewrites them as a smaller number
+of larger files.
+The data does not change — only the physical layout.
+After compaction, a query that previously had to open 500 files might only need to open 5.
 
-## `maintain()` capabilities
+Compaction is the operation you run most frequently.
+It directly addresses the fragmentation caused by incremental writes.
 
-You can request:
+## Z-ordering: clustering data for faster filter pushdown
 
-- **compaction** (coalesce small files),
-- **Z-ordering** (`z_order_by`) for better pruning on common filter columns,
-- **vacuum** to delete stale files older than retention.
+Z-ordering is an optional step that reorders rows within the compacted files so that rows
+with similar values of a chosen column are stored close together.
 
-These operations are expressed in one API so teams can run them manually or from scheduled jobs.
+When a query filters on that column — e.g. `WHERE device_id = 42` — Delta's file-level
+statistics (which record the min and max value of each column per file) can skip entire files
+that cannot contain the target value.
+Z-ordering maximises the effectiveness of that skipping by ensuring that the value range
+within each file is as narrow as possible.
+
+```python
+pipeline.maintain(z_order_by="device_id")
+```
+
+Z-ordering is worth enabling when you have a column that appears frequently in `WHERE` clauses
+and has high cardinality.
+It is less useful for low-cardinality columns (e.g. a boolean flag) because there are too few
+distinct values to produce meaningful file skipping.
+
+## Vacuum: removing stale files
+
+Delta Lake uses **time travel** to serve queries at past table versions.
+When you compact or overwrite, the old files are not deleted immediately — they are retained
+so that a query like `pl.scan_delta(path, version=10)` can still read the state of the table
+at version 10.
+
+`vacuum` deletes files that are no longer needed by any version within the retention window.
+The default retention is 168 hours (7 days), matching Delta's own default.
+Files newer than the retention threshold are never removed, even if they are no longer
+referenced by the current version.
+
+```python
+pipeline.maintain(compact=True, vacuum=True, retention_hours=168)
+```
 
 ## Ordering guarantee: compact before vacuum
 
-When both are enabled, the library runs compaction first and vacuum second. This ordering is crucial: vacuum-before-compaction can remove files you still need for safe rewrite behavior and time-travel windows.
+When both compaction and vacuum are requested, the library always runs compaction first.
+The reason is subtle but important: compaction writes new, larger files and marks the old
+small files as logically deleted.
+If you vacuum first, you remove files that the compaction step would have read.
+The compaction either fails or silently skips those files, producing an incomplete result.
+Running compact → vacuum in that order avoids the problem entirely.
 
 ## Automatic trigger with `compact_every`
 
-Instead of external scheduling for every pipeline, `compact_every=N` compacts after every N successful runs.
+Rather than scheduling compaction externally for each pipeline, you can set `compact_every=N`
+in the decorator and let the pipeline trigger it automatically:
 
-The trigger state is persisted in a run-counter Delta sub-table at:
+```python
+@incremental(source="/data/uploads/", target="/data/delta/readings",
+             merge_on="id", compact_every=24)
+def readings(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf
+```
 
-`<watermark_store>/_runs`
+After every successful `run()`, the library increments a run counter stored in a small Delta
+sub-table at `<watermark_store>/_runs`.
+When the counter reaches a multiple of `compact_every`, `maintain()` is called automatically.
 
-Because this counter is persisted, behavior remains stable across process restarts.
+The counter is persisted in Delta, so process restarts do not reset it.
+A pipeline that runs hourly with `compact_every=24` will compact roughly once per day,
+regardless of how many times the process has been restarted in between.
 
 ## Practical scheduling guidance
 
-A common pattern is:
+A common pattern across the Munich examples in this project is:
 
-- ingestion runs hourly (or faster),
-- compaction weekly,
-- vacuum daily with retention that matches governance requirements.
+- **ingestion**: hourly (or faster), driven by file arrival,
+- **compaction**: daily or weekly, either via `compact_every` or a separate scheduled job,
+- **vacuum**: daily, with a retention window that matches your governance and time-travel requirements.
 
-The separate `maintenance.py` module keeps this operational concern isolated from ingestion logic, which helps keep pipeline code clear.
+The `maintain()` function lives in a separate `maintenance.py` module, which means it can be
+called from scheduled jobs or orchestration tools independently of any pipeline.
+You are not required to go through `@incremental` to run maintenance on a table.

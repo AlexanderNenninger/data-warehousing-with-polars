@@ -259,7 +259,6 @@ poe test_memory  # memory-boundedness tests (each in a fresh subprocess)
 - polars >= 1.41.0
 - deltalake >= 0.22.3
 - pyarrow >= 19.0.0
-- pydantic >= 2.0.0
 
 ## License
 

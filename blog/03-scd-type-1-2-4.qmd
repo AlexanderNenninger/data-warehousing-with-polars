@@ -6,48 +6,217 @@ Warehouse table design is mostly about one question:
 
 **Do you only need current state, or do you need history too?**
 
-This library supports SCD Type 1, 2, and 4 so you can choose per pipeline.
+SCD stands for *Slowly Changing Dimension* — a term from data warehousing for tables where
+the values of rows change over time.
+A customer changes their address.
+A product moves to a new category.
+An employee moves to a different department.
+The question is not whether those changes happen, but whether you need to record that they
+happened and when.
 
-## SCD Type 1 (default): latest state only
+The `@incremental` decorator starts with a simple upsert (Type 1) and gains history support
+through two successive additions: an `scd_type` parameter and a `history_target` parameter.
+This post builds those additions up one at a time.
 
-With `merge_on=...` and default `scd_type=1`, each run upserts rows by key:
+## Step 1 — Type 1: the basic upsert
 
-- matching key -> update existing row,
-- new key -> insert row.
+The simplest case from [the previous post](01-why-polars-delta-warehouse.qmd): find rows
+in the incoming batch whose key already exists in the target table, update them in-place,
+and insert the rest.
 
-Use this when analytics only needs current values and historical versions are not required.
+```python
+predicate = " AND ".join(f"target.{k} = source.{k}" for k in keys)
+(
+    DeltaTable(target)
+    .merge(df.to_arrow(), predicate=predicate, source_alias="source", target_alias="target")
+    .when_matched_update_all()
+    .when_not_matched_insert_all()
+    .execute()
+)
+```
 
-## SCD Type 2: full in-table history
+Previous values are overwritten and gone.
+The table always holds one row per key and reflects the most recent version.
 
-With `scd_type=2`, the library keeps row history directly in the same table by adding:
+In the decorator this is the default — no extra parameters needed:
 
-- `valid_from`,
-- `valid_to`,
-- `is_current`.
+```python
+@incremental(source="/data/uploads/", target="/data/delta/customers", merge_on="id")
+def customers(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf
+```
 
-When a key changes, previous current rows are closed (`valid_to` set, `is_current=false`) and a new current row is appended.
+This is the right choice when analytics only needs current values.
+It keeps the table small and merge semantics simple.
 
-This enables point-in-time queries without joining to a separate history table.
+## Step 2 — Type 2: adding temporal history in the same table
 
-A practical detail in the implementation: appends are deduplicated on `(merge_on, valid_from)` to keep re-runs idempotent for the same input batch.
+Suppose you need to answer "what city did Alice live in on 1 March 2024?".
+Type 1 cannot answer that — Alice's old address is gone.
 
-## SCD Type 4: split current and history tables
+To preserve history, instead of updating the old row we need to:
+1. record when the old version stopped being true,
+2. append the new version with a start timestamp.
 
-With `scd_type=4`, you provide `history_target=...` and get:
+That requires three new columns in every row:
 
-- a compact main table containing current state,
-- a separate append-only history table containing superseded versions with `superseded_at`.
+| column | type | meaning |
+|---|---|---|
+| `valid_from` | `Timestamp` | when this version became active |
+| `valid_to` | `Timestamp` (nullable) | when it was superseded; `null` = still active |
+| `is_current` | `Boolean` | convenience flag for filtering current rows |
 
-Choose this when you want fast current-state reads while still retaining historical auditability.
+Before writing, the library injects these columns into the incoming frame:
 
-## Implementation note from `scd.py`
+```python
+now = datetime.now(timezone.utc)
+df = lf.with_columns(
+    pl.lit(now).alias("valid_from"),
+    pl.lit(None).cast(pl.Datetime("us", "UTC")).alias("valid_to"),
+    pl.lit(True).alias("is_current"),
+).collect()
+```
 
-The SCD2 merge flow intentionally keeps `target.is_current = true` in the matched-update predicate instead of the outer merge predicate. This avoids a known Delta kernel stats issue around boolean columns in min/max metadata.
+Then the write happens in two separate merge passes against the target table.
 
-This is a good example of why encoding SCD behavior in one shared library is valuable: operational edge cases are solved once and reused consistently.
+**Pass 1 — close the previous version.**
+For every key in the incoming batch, find the current row in the target and stamp it closed:
+
+```python
+(
+    DeltaTable(target)
+    .merge(df.to_arrow(), predicate=key_pred, source_alias="source", target_alias="target")
+    .when_matched_update(
+        predicate="target.is_current = true",          # only close the active version
+        updates={
+            "valid_to": f"CAST('{now_sql}' AS TIMESTAMP)",
+            "is_current": "false",
+        },
+    )
+    .execute()
+)
+```
+
+Note: the `is_current = true` filter is placed inside `when_matched_update`, not in the
+outer merge predicate.
+See [the note below](#implementation-note-the-is_current-predicate-placement) for why.
+
+**Pass 2 — append the new version.**
+Before appending, deduplicate on `(merge_on, valid_from)` to make re-runs of the same batch
+idempotent — if the same file is processed twice, the second run produces no new rows:
+
+```python
+dedup_cols = keys + ["valid_from"]
+existing = pl.scan_delta(target).select(dedup_cols).collect()
+new_df = df.join(existing, on=dedup_cols, how="anti")   # rows not already in the table
+if len(new_df) > 0:
+    write_deltalake(target, new_df.to_arrow(), mode="append")
+```
+
+After two runs (Berlin in January, Munich in June), the table looks like this:
+
+```
+id | name  | city   | valid_from          | valid_to            | is_current
+---|-------|--------|---------------------|---------------------|----------
+1  | Alice | Berlin | 2024-01-01 08:00:00 | 2024-06-01 08:00:00 | false
+1  | Alice | Munich | 2024-06-01 08:00:00 | null                | true
+```
+
+To query current state: `WHERE is_current = true`.  
+To query the state at a past timestamp `T`: `WHERE valid_from <= T AND (valid_to IS NULL OR valid_to > T)`.  
+No join to a second table is needed.
+
+Adding Type 2 to the decorator requires just one parameter:
+
+```python
+@incremental(source="/data/uploads/", target="/data/delta/customers",
+             merge_on="id", scd_type=2)
+def customers(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf
+```
+
+The decorator dispatches to the two-pass write logic when `scd_type=2` is set;
+for everything else the behaviour is identical.
+
+## Step 3 — Type 4: splitting current state and history into separate tables
+
+Type 2 keeps all history in one table.
+If the main table grows very large — many keys, many versions each — queries over current
+state start scanning a lot of stale rows before the `is_current` filter is applied.
+
+Type 4 solves this by maintaining two tables:
+
+- **main table** (`target`) — one row per key, latest values only, always small and fast.
+- **history table** (`history_target`) — append-only archive of superseded rows, each stamped with `superseded_at`.
+
+The write sequence is:
+
+**Step 1 — archive affected rows.**
+Before updating the main table, copy the current versions of incoming keys into the history table:
+
+```python
+incoming_keys = df.select(keys).unique()
+current = (
+    pl.scan_delta(target)
+    .join(incoming_keys.lazy(), on=keys, how="inner")
+    .with_columns(pl.lit(now).alias("superseded_at"))
+    .collect()
+)
+if len(current) > 0:
+    write_deltalake(history_target, current.to_arrow(), mode="append")
+```
+
+**Step 2 — upsert the main table (Type 1 semantics).**
+Once the current values are safely archived, overwrite them with the incoming versions:
+
+```python
+(
+    DeltaTable(target)
+    .merge(df.to_arrow(), predicate=key_pred, source_alias="source", target_alias="target")
+    .when_matched_update_all()
+    .when_not_matched_insert_all()
+    .execute()
+)
+```
+
+New keys are inserted into the main table only — they do not appear in history until
+a subsequent batch changes them.
+
+Adding Type 4 to the decorator requires `scd_type=4` and the `history_target` path.
+If `history_target` is omitted, the decorator raises a `ValueError` at decoration time:
+
+```python
+@incremental(
+    source="/data/uploads/",
+    target="/data/delta/customers",
+    history_target="/data/delta/customers_history",
+    merge_on="id",
+    scd_type=4,
+)
+def customers(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf
+```
+
+The decorator dispatches to the archive-then-upsert write logic when `scd_type=4` is set.
+
+## Implementation note: the `is_current` predicate placement
+
+In the Type 2 merge (Pass 1 above), the `target.is_current = true` condition is placed
+inside `when_matched_update` rather than in the outer merge predicate.
+
+If it were in the outer predicate, the Delta merge engine would use it during file pruning —
+looking at per-file min/max column statistics to skip files that cannot match.
+Boolean columns do not appear in Delta's min/max statistics, so the engine cannot safely skip
+any files and raises an error in `deltalake` 1.6.
+Placing the condition inside the per-action predicate moves it past the file-skipping step
+entirely.
+
+This is a good example of why encoding SCD behaviour in a shared library is useful:
+a subtle correctness detail like this is solved once and applied consistently to every
+pipeline that uses `scd_type=2`.
 
 ## How to choose
 
-- **Type 1**: simplest, smallest table, no history.
-- **Type 2**: full temporal history in one table, easiest point-in-time modeling.
-- **Type 4**: current-state performance plus separate historical archive.
+- **Type 1**: simplest, smallest table, no history. Use for reference data where previous values have no analytical value (e.g. a product catalogue where only the current description matters).
+- **Type 2**: full temporal history in one table, easiest point-in-time modelling. Use when you need to answer "what did this row look like on date X?" and the table size stays manageable.
+- **Type 4**: current-state query performance plus a separate historical archive. Use when the main table is queried frequently under tight latency constraints and history is an audit or compliance concern rather than a primary analytical dimension.
