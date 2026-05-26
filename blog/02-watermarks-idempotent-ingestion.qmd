@@ -1,0 +1,131 @@
+---
+title: Watermarks — Never Reprocess a File You've Already Seen
+---
+
+Incremental ingestion sounds simple until you hit operational reality:
+
+- processes crash mid-run,
+- files are retried by an upstream system,
+- jobs restart on new machines with no local state,
+- and you must avoid duplicate writes.
+
+The core question every incremental pipeline has to answer is: *which inputs have already been
+committed to the target table?*
+Get that wrong and you either miss data or write it twice.
+This post explains exactly how this library answers that question and why each design decision
+was made the way it was.
+
+## What a watermark is
+
+A watermark is a persistent record of which inputs a pipeline has already processed successfully.
+"Successfully" is the key word: the watermark is only updated *after* the target write completes.
+That ordering is what gives you safe restarts.
+
+Without a watermark, a pipeline restarted after a crash has no way to know whether the previous
+run wrote anything to the target.
+It has to choose between re-reading everything from the beginning (safe but wasteful) or
+guessing at what was already done (fast but likely wrong).
+A watermark removes the ambiguity.
+
+## How this library stores watermark state
+
+The watermark is a Delta table with one row per processed file.
+By default it lives under `<target>/.watermark`, co-located with the data it tracks.
+Each row records the ingested file path and the UTC timestamp when it was written:
+
+```
+file_path                              | ingested_at
+---------------------------------------|----------------------------
+/data/raw/customers/2024-01-01.parquet | 2024-01-01 08:00:01+00:00
+/data/raw/customers/2024-01-02.parquet | 2024-01-02 08:00:03+00:00
+```
+
+At the start of each run, the library loads all `file_path` values into a set.
+Any file already in that set is skipped.
+Only the remainder — the *new* files — are scanned, transformed, and written to the target.
+Once the target write completes without error, the new paths are appended to the watermark.
+
+Storing this in Delta rather than a plain file or a database has practical advantages.
+Delta writes are atomic: either the append commits fully or it does not appear at all.
+The table is also queryable with `pl.scan_delta`, so you can inspect or audit it directly
+without any special tooling.
+
+## The write-before-watermark ordering
+
+The most important property of the implementation is the sequence of operations:
+
+1. Scan new files.
+2. Apply the transform.
+3. Write to the target table.
+4. Write to the watermark table.
+
+Steps 3 and 4 are deliberately separate.
+If the process crashes between them, the watermark still shows the files as unprocessed.
+The next run will pick them up again and write them a second time.
+For append tables, this produces a duplicate row.
+For upsert tables (where `merge_on` is set), re-processing the same file just produces
+identical merge matches and the table ends up in the same state as if the file had been
+processed only once.
+
+The technical name for this property is **at-least-once** delivery: every file is guaranteed
+to be processed, possibly more than once.
+The opposite — **exactly-once** — requires a distributed transaction across both writes,
+which Delta Lake does not provide across two separate tables.
+At-least-once combined with idempotent writes (i.e. upsert) is the standard practical
+substitute.
+
+## Day-to-day controls
+
+`IncrementalPipeline` exposes three operational helpers that are useful in production:
+
+**`run(dry_run=True)`** lists the files that *would* be processed without reading or writing
+anything.
+This is useful before a first run on a large backlog, or after a schema change, to verify
+that the pipeline will pick up exactly the files you expect.
+
+**`status()`** returns the watermark table as an eager `DataFrame`.
+You can filter and inspect it directly to answer questions like "when was this file last
+ingested?" or "how many files were processed in the last 24 hours?".
+
+**`reset()`** deletes all rows from the watermark table, making the next `run()` treat every
+file as new.
+This is useful when you want to re-derive the target table from scratch — for example after
+changing the transform logic or recovering from a bad write.
+
+## Delta source variant: version watermarks
+
+When `file_format="delta"`, the source is another Delta table and the pipeline reads it via
+**Change Data Feed** (CDF) — a feature that exposes only the rows that changed since a given
+version.
+
+In this mode, tracking file paths does not make sense because there are no individual files
+to track.
+Instead, the watermark records the latest source **version** that was successfully processed:
+
+```
+version | committed_at
+--------|----------------------------
+0       | 2024-01-01 08:00:01+00:00
+3       | 2024-01-02 08:00:03+00:00
+```
+
+On each run, the library reads the max version from the watermark, fetches all CDF changes
+from `max_version + 1` up to the current source version, processes them, and appends the new
+version number to the watermark.
+If there are no new versions, the run returns immediately without touching the target.
+
+The concept is exactly the same as file-path watermarking.
+Only the unit of progress changes: file paths become version numbers.
+
+## Why this matters
+
+Without watermarks, incremental ingestion has no memory.
+Every run that wants to avoid full rewrites has to implement its own notion of "what did I
+already do?" — usually through timestamp filters, filename patterns, or ad hoc deduplication
+downstream.
+Those approaches are fragile, hard to audit, and tend to break quietly.
+
+A persistent, auditable watermark table makes the pipeline's progress an observable fact.
+You can inspect it, reset it, and reason about it independently of the target table.
+That is what makes retries safe and idempotency a property of the pipeline contract rather
+than something each transform function has to enforce for itself.

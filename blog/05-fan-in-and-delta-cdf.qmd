@@ -1,0 +1,258 @@
+---
+title: Fan-In Pipelines and Delta Change Data Feed
+---
+
+Two capabilities unlock more complex incremental architectures:
+
+1. ingesting from multiple source directories in one run,
+2. ingesting only the rows that changed in an upstream Delta table.
+
+Both are built on the same watermark and `LazyFrame` primitives from the previous posts.
+This post builds each up from scratch.
+
+## Fan-in with multiple source paths
+
+A **fan-in** pipeline reads from more than one source directory and merges them into a single
+target table.
+This comes up naturally when data arrives from separate regional drops, separate tenants, or
+separate upstream systems that you want to consolidate without writing separate pipelines for each.
+
+### Step 1: extend file discovery to multiple sources
+
+The single-source pipeline walks one directory and filters out already-processed files.
+Extending to multiple sources is straightforward — walk each source separately and accumulate
+the results:
+
+```python
+sources = ["/data/region_a/", "/data/region_b/"]
+processed = _load_watermark(watermark_store)
+
+all_files: list[str] = []
+for src in sources:
+    all_files.extend(
+        str(p.resolve())
+        for p in Path(src).rglob("*.parquet")
+        if str(p.resolve()) not in processed
+    )
+new_files = sorted(all_files)
+```
+
+The watermark still tracks individual file paths, so a file in `region_a` and a file in
+`region_b` with the same basename are tracked independently.
+A run that only has new files in `region_a` does not re-process `region_b`.
+
+### Step 2: group new files back to their source directory
+
+After collecting all new files, the pipeline needs to scan them as separate `LazyFrame`
+arguments — one per source — so the transform function can handle per-source logic.
+
+The grouping is done by checking which source root each new file belongs to:
+
+```python
+frames: list[pl.LazyFrame] = []
+for src in sources:
+    src_root = str(Path(src).resolve())
+    src_files = [f for f in new_files if f.startswith(src_root)]
+    if src_files:
+        frames.append(pl.scan_parquet(src_files))
+```
+
+If a source has no new files, it contributes nothing to `frames`.
+That means the argument count passed to the transform can vary run-by-run.
+
+### Step 3: dispatch to the transform
+
+With the list of per-source frames, the call is simply:
+
+```python
+result_lf = fn(*frames)   # unpack: fn(lf_a, lf_b) or fn(lf_a) or fn(lf_b)
+```
+
+For a fixed-arity transform that expects exactly two arguments, use named parameters:
+
+```python
+@incremental(
+    source=["/data/region_a/", "/data/region_b/"],
+    target="/data/delta/combined",
+    merge_on="id",
+)
+def combine(lf_a: pl.LazyFrame, lf_b: pl.LazyFrame) -> pl.LazyFrame:
+    return pl.concat([lf_a, lf_b])
+```
+
+For a variable number of active sources, use `*lfs`:
+
+```python
+@incremental(
+    source=["/data/region_a/", "/data/region_b/", "/data/region_c/"],
+    target="/data/delta/combined",
+    merge_on="id",
+)
+def combine(*lfs: pl.LazyFrame) -> pl.LazyFrame:
+    return pl.concat(list(lfs))
+```
+
+The rest of the pipeline — write, watermark save, optional compaction — is identical to the
+single-source case.
+
+## Delta as a source with Change Data Feed
+
+**Change Data Feed** (CDF) is a Delta Lake feature that records row-level changes — inserts,
+updates, and deletes — as they happen in a table.
+Instead of re-reading the full source table on every run, a consumer can ask for only the rows
+that changed since a specific table version.
+
+### Step 1: the version watermark
+
+For file-based sources the watermark stores file paths.
+For a Delta source there are no individual files to track — instead, the watermark stores the
+last processed **table version** (an integer that Delta increments on every write):
+
+```python
+def _load_delta_watermark(store: str) -> int | None:
+    try:
+        result = pl.scan_delta(store).select(pl.col("version").max()).collect()
+        val = result["version"][0]
+        return int(val) if val is not None else None
+    except Exception:
+        return None   # first run
+
+def _save_delta_watermark(store: str, version: int) -> None:
+    rows = pl.DataFrame({
+        "version": [version],
+        "committed_at": [datetime.now(timezone.utc)],
+    })
+    write_deltalake(store, rows, mode="append")
+```
+
+On first run `_load_delta_watermark` returns `None`.
+After a successful run it stores the version number that was current at the time.
+
+### Step 2: reading the source — full scan on first run, CDF on subsequent runs
+
+```python
+dt = DeltaTable(source_path)
+current_version = dt.version()
+
+if from_version is None:
+    # First run: read full current state as the baseline.
+    lf = pl.scan_delta(source_path)
+else:
+    # Subsequent runs: read only what changed since last time.
+    reader = dt.load_cdf(
+        starting_version=from_version + 1,
+        ending_version=current_version,
+    )
+    lf = make_lazy(reader)   # wrap RecordBatchReader — see next section
+```
+
+`dt.load_cdf()` returns a `RecordBatchReader` covering the requested version range.
+`make_lazy` converts it to a `LazyFrame` (explained below).
+
+### Step 3: filtering CDF metadata columns
+
+CDF adds three internal columns to every row:
+
+| column | meaning |
+|---|---|
+| `_change_type` | `"insert"`, `"update_preimage"`, `"update_postimage"`, `"delete"` |
+| `_commit_version` | which Delta version this change belongs to |
+| `_commit_timestamp` | when the commit happened |
+
+For a downstream pipeline, only the current state of a row matters — not the pre-update
+image and not deletes.
+Filter to the relevant change types and drop the metadata before the transform sees anything:
+
+```python
+lf = (
+    lf
+    .filter(pl.col("_change_type").is_in(["insert", "update_postimage"]))
+    .drop(["_change_type", "_commit_version", "_commit_timestamp"])
+)
+```
+
+After these two steps the `LazyFrame` looks identical to what a file-based pipeline produces.
+The transform function is unaware of the difference:
+
+```python
+@incremental(
+    source="/data/delta/upstream",
+    target="/data/delta/downstream",
+    merge_on="id",
+    file_format="delta",
+)
+def propagate(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf.rename({"raw_value": "value"})
+```
+
+## Streaming bridge: Arrow record batches to Polars lazy execution
+
+`dt.load_cdf()` returns a PyArrow `RecordBatchReader` — a streaming cursor that yields one
+`RecordBatch` at a time.
+Polars has no built-in way to accept a `RecordBatchReader` as a lazy source, so a bridge is
+needed.
+
+### Step 1: the naive approach and why it fails
+
+The obvious solution is to read everything into memory at once:
+
+```python
+lf = pl.from_arrow(reader.read_all()).lazy()
+```
+
+This works, but `reader.read_all()` materialises the entire change set before any query
+optimisation can run.
+For large tables with many changes, that defeats the purpose of streaming ingestion.
+
+### Step 2: batch-by-batch with `register_io_source`
+
+Polars exposes a plugin API — `register_io_source` — that lets you register a Python generator
+as a lazy data source.
+The generator yields one `DataFrame` per call; Polars pulls from it on demand as the query
+engine requests morsels.
+
+The generator wraps the `RecordBatchReader` loop:
+
+```python
+from polars.io.plugins import register_io_source
+
+def _source_gen(with_columns, predicate, n_rows, batch_size):
+    rows_yielded = 0
+    while True:
+        try:
+            batch = reader.read_next_batch()
+        except StopIteration:
+            return
+        df = pl.from_arrow(batch)
+        if with_columns is not None:
+            df = df.select([c for c in with_columns if c in df.columns])
+        if n_rows is not None:
+            remaining = n_rows - rows_yielded
+            if remaining <= 0:
+                return
+            df = df.head(remaining)
+        rows_yielded += len(df)
+        yield df
+```
+
+`register_io_source` requires the schema upfront so Polars can plan operations before reading:
+
+```python
+schema_frame = pl.from_arrow(reader.schema.empty_table())
+polars_schema = schema_frame.schema
+
+lf = register_io_source(_source_gen, schema=polars_schema)
+```
+
+### Step 3: what the callback arguments enable
+
+The four callback parameters (`with_columns`, `predicate`, `n_rows`, `batch_size`) are
+provided by the Polars query optimiser when it can push work down into the source:
+
+- `with_columns` — a list of column names the query actually needs. Unused columns can be dropped per batch before they are ever yielded, saving memory and conversion cost.
+- `n_rows` — a row limit (e.g. from `.head(N)`). Once `rows_yielded >= n_rows` the generator returns early, stopping the reader without consuming the rest of the change set.
+- `predicate` — a Polars expression the optimiser would like the source to apply. The generator can optionally honour it for an early filter; any rows the generator passes through will still be filtered downstream.
+
+The result is a `LazyFrame` that behaves identically to one produced by `pl.scan_parquet` —
+the transform function, the merge logic, and the SCD machinery downstream have no knowledge
+of the underlying `RecordBatchReader`.

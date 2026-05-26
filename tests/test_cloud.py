@@ -47,6 +47,7 @@ def run_id():
     return uuid.uuid4().hex[:8]
 
 
+@pytest.mark.slow
 def test_incremental_remote_append(ctx, bucket, run_id):
     """@incremental with compute_context executes the transform on the cluster
     and appends results to a Delta table via Parquet staging.
@@ -81,6 +82,7 @@ def test_incremental_remote_append(ctx, bucket, run_id):
     assert pipeline.run() == []
 
 
+@pytest.mark.slow
 def test_incremental_remote_merge(ctx, bucket, run_id):
     """@incremental with compute_context and merge_on upserts correctly."""
     from data_warehousing_with_polars import incremental

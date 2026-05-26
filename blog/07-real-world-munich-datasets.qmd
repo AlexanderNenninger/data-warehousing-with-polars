@@ -1,0 +1,108 @@
+---
+title: Real-World Example — Munich Open Datasets
+---
+
+The best way to understand a framework is to see it applied to real data with real quirks.
+The Munich examples in this project are drawn from the city's open data portal and cover
+two distinct ingestion patterns that come up frequently in production:
+
+- **Monatszahlen** — monthly statistical indicators published as snapshot CSVs that are
+  republished in full each time new data arrives,
+- **cycling counters** — 15-minute interval counts from permanent counting stations,
+  delivered as cumulative Parquet exports.
+
+These two datasets exercise different parts of the library and surface different operational
+considerations.
+
+## Monatszahlen: snapshot-replacement ingestion
+
+The Monatszahlen dataset covers monthly figures across several Munich statistical categories —
+labor, tourism, traffic, and others.
+The city portal republishes the full CSV for each category every month, not just the new rows.
+That means the same historical rows appear in every delivery.
+
+This is the classic **snapshot-replacement** pattern.
+A naive append would duplicate every historical row on every run.
+The pipeline handles it by using `merge_on` with a composite natural key and adding a
+deduplication step inside the transform:
+
+```python
+@incremental(
+    source=source_path,
+    target=target_path,
+    merge_on=["MONATSZAHL", "AUSPRAEGUNG", "MONAT"],
+)
+def ingest(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return (
+        lf.filter(pl.col("MONAT") != "Summe")       # drop annual summary rows
+          .with_columns(
+              pl.col("MONAT").str.strptime(pl.Date, "%Y%m").alias("date"),
+          )
+          .unique(subset=["MONATSZAHL", "AUSPRAEGUNG", "MONAT"], keep="last")
+    )
+```
+
+The `unique()` call handles duplicate rows within a single delivery.
+The `merge_on` handles the case where a row from a previous delivery appears again in the
+current one — the merge finds the existing row by key and updates it in-place rather than
+inserting a second copy.
+
+The pipeline also maintains a separate **month-stamp watermark** (`_already_processed`) to
+skip months that have not changed since the last run, avoiding unnecessary merge operations
+even when the source file is new.
+
+## Cycling counters: append-only time series
+
+The cycling counter dataset records 15-minute bicycle counts at stations around the city.
+New intervals are simply appended — historical rows never change.
+This is a straightforward append-only pipeline with no merge key:
+
+```python
+@incremental(source=source_path, target=target_path)
+def ingest(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf.with_columns(
+        pl.col("datum_uhrzeit").str.to_datetime().alias("ts"),
+    )
+```
+
+Without `merge_on`, every run appends the new rows and leaves existing rows untouched.
+The watermark ensures each source file is read exactly once.
+
+## Lessons from both pipelines
+
+A few operational patterns repeated across both examples:
+
+**Choose `merge_on` based on source behavior, not table shape.**
+The Monatszahlen pipeline needs a merge key because the source republishes old rows.
+The cycling pipeline does not because the source is purely additive.
+Getting this wrong in either direction produces either duplicates (no key on a snapshot source)
+or unnecessary merge overhead (key on an additive source).
+
+**Partition on query filters, not source shape.**
+Both pipelines partition by a date-derived column — by month for Monatszahlen, by date for
+cycling.
+The partitioning reflects how analysts will filter the data, not how the source delivers it.
+
+**Allow schema evolution where source owners drift.**
+The Monatszahlen CSV format has changed column names and types over the years.
+Using `evolution="cast"` in `@schema` absorbs those changes without failing the pipeline,
+while still rejecting genuinely broken deliveries.
+
+**Keep reset workflows explicit for backfills.**
+When the transform logic changes — a new derived column, a corrected date parse — calling
+`pipeline.reset()` followed by `pipeline.run()` reprocesses all historical files and
+rebuilds the target table cleanly.
+This is safer than trying to apply a partial fix to the existing table.
+
+## Where to go next
+
+After walking through these examples, the natural next step is to apply the same pattern
+to your own domain data.
+The decisions are always the same four:
+
+1. What is the source delivery pattern — snapshot-replacement or append-only?
+2. What is the natural key for merges, if any?
+3. Which columns are stable enough to partition on?
+4. How strict should schema validation be, and where should failures go?
+
+The library handles the operational plumbing once those decisions are made.

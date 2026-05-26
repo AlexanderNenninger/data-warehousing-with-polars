@@ -4,12 +4,7 @@ version = "0.1.0"
 description = "ACID data warehousing with Polars and Delta Lake"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = [
-    "polars>=1.30.0",
-    "deltalake>=0.22.3",
-    "pyarrow>=19.0.0",
-    "pydantic>=2.10.0",
-]
+dependencies = ["polars>=1.30.0", "deltalake>=0.22.3", "pyarrow>=19.0.0"]
 
 [project.optional-dependencies]
 cloud = ["polars-cloud>=0.6.3"]
@@ -49,8 +44,9 @@ select = ["E", "F", "I"]
 fmt = "ruff format src tests app"
 lint = "ruff check src tests app --fix --unsafe-fixes"
 typecheck = "ty check src app"
-test = "pytest tests/ --ignore=tests/test_memory.py -v"
+test = "pytest tests/ --ignore=tests/test_memory.py -v -m 'not slow'"
 test_memory = "pytest tests/test_memory.py -v"
+test_cloud = "pytest tests/test_cloud.py -v"
 test_min_versions.sequence = [
     { cmd = "uv sync --resolution=lowest-direct" },
     { cmd = "pytest tests/ --ignore=tests/test_memory.py -v" },
