@@ -58,6 +58,13 @@ def events(lf: pl.LazyFrame) -> pl.LazyFrame:
     return lf
 ```
 
+#### How upserts scale
+
+Upserts are applied by **rewriting only the data a batch touches**, never the whole table, and without using Delta `MERGE` (which mis-handles large match sets):
+
+- **Partitioned target** (`partition_by=` set) — only the partitions present in the incoming batch are rewritten (`replaceWhere`). A batch that lands in a few partitions costs the same regardless of how large the table is, so partitioned tables scale to arbitrary size. Partition by a column your batches are naturally bounded on (e.g. a date or region).
+- **Unpartitioned target** — the upsert reads the table, swaps the affected keys, and rewrites it in full. Correct at any size but **O(table)** per run; partition the target if write cost matters.
+
 ### SCD Type 2 — full row history
 
 `scd_type=2` keeps the complete history of every row. Each time a key reappears, the old row is closed (`is_current = false`, `valid_to = <now>`) and a new row is appended (`is_current = true`, `valid_to = null`).
@@ -115,9 +122,9 @@ def users(lf: pl.LazyFrame) -> pl.LazyFrame:
 
 The main table stays small and fast to query. The history table is append-only and accumulates one row per superseded version.
 
-### Fan-in — multiple source directories
+### Fan-in — multiple sources
 
-Pass a list of paths to `source` to read from multiple directories in a single run. Each source directory produces one `LazyFrame` argument; the transform receives them as positional arguments in the same order as `source`.
+Pass a list to `source` to read from multiple sources in a single run. Each source produces one `LazyFrame` argument; the transform receives them as positional arguments in the same order as `source`.
 
 ```python
 @incremental(
@@ -129,13 +136,27 @@ def combine(lf_a: pl.LazyFrame, lf_b: pl.LazyFrame) -> pl.LazyFrame:
     return pl.concat([lf_a, lf_b])
 ```
 
-Sources with no new files are omitted from the call, so the number of arguments can vary between runs. Use `*lfs` when the number of sources is not fixed:
+Sources with nothing new are omitted from the call, so the number of arguments can vary between runs. Use `*lfs` when the number of sources is not fixed:
 
 ```python
 @incremental(source=["/data/a/", "/data/b/", "/data/c/"], target="/data/delta/all", merge_on="id")
 def ingest(*lfs: pl.LazyFrame) -> pl.LazyFrame:
     return pl.concat(list(lfs))
 ```
+
+Fan-in works for **every source type**, each tracked by its own cursor: a list of Delta tables (with `file_format="delta"`), a list of custom `Source` objects, or a **mix** of directories and custom sources in one pipeline:
+
+```python
+@incremental(
+    source=["/data/uploads/", from_query(fetch_orders, cursor_on="updated_at")],
+    target="/data/delta/combined",
+    merge_on="id",
+)
+def combine(*lfs: pl.LazyFrame) -> pl.LazyFrame:
+    return pl.concat(list(lfs))
+```
+
+The one combination a single list can't express is directories *and* Delta tables together, because `file_format` applies to the whole pipeline — wrap one of them as a custom `Source` if you need that mix.
 
 ### Delta source — Change Data Feed
 
@@ -275,7 +296,7 @@ except SchemaError as e:
 
 ### Partitioning
 
-Pass `partition_by=` to partition the target table. Partitioning is fixed at table creation and improves query performance on large tables when filtering by the partition column.
+Pass `partition_by=` to partition the target table. Partitioning is fixed at table creation, improves query performance when filtering by the partition column, and — for `merge_on` upserts — bounds how much data each run rewrites (see [How upserts scale](#how-upserts-scale)). Partitioning is the lever for upserting into arbitrarily large tables.
 
 ```python
 @incremental(
