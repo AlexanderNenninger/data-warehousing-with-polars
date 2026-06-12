@@ -70,6 +70,14 @@ reference:
       - incremental.incremental
       - schema.schema
 
+  - title: Sources
+    desc: Source helpers and the protocol for custom incremental sources
+    contents:
+      - incremental.from_query
+      - incremental.from_frame
+      - incremental.Source
+      - incremental.Batch
+
 sections:
   - title: Blog
     dir: blog
