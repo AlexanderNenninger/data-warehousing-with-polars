@@ -67,8 +67,6 @@ except ImportError:
     print("python-dotenv not found, skipping .env loading")
 
 
-load_dotenv()
-
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
