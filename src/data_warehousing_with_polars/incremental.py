@@ -7,10 +7,12 @@ Coordinates file listing, watermark tracking, transform dispatch, and compaction
 
 from __future__ import annotations
 
+import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Literal, cast
+from typing import Callable, Literal, Protocol, cast, runtime_checkable
 
 import polars as pl
 from deltalake import DeltaTable, WriterProperties, write_deltalake
@@ -100,6 +102,35 @@ def _save_delta_watermark(store: str, version: int) -> None:
         }
     )
     write_deltalake(store, rows, mode="append")
+
+
+def _load_json_cursor(store: str) -> object | None:
+    """Return the most recently saved JSON cursor, or ``None`` on first run."""
+    try:
+        result = cast(
+            pl.DataFrame,
+            pl.scan_delta(store)
+            .select("cursor_json", "saved_at")
+            .sort("saved_at")
+            .tail(1)
+            .collect(),
+        )
+        if len(result) == 0:
+            return None
+        return json.loads(result["cursor_json"][0])
+    except Exception:
+        return None
+
+
+def _save_json_cursor(store: str, cursor: object) -> None:
+    """Append a JSON-serialised *cursor* with a ``saved_at`` timestamp."""
+    rows = pl.DataFrame(
+        {
+            "cursor_json": [json.dumps(cursor, default=str)],
+            "saved_at": [datetime.now(timezone.utc)],
+        }
+    )
+    write_deltalake(store, rows, mode="overwrite", schema_mode="overwrite")
 
 
 def _scan_files(
@@ -218,11 +249,146 @@ def _sink_target(
     )
 
 
+# ── Source protocol and built-in implementations ──────────────────────────────
+
+
+@dataclass(frozen=True)
+class Batch:
+    """A batch of data returned by a :class:`Source`, paired with its cursor.
+
+    Attributes:
+        frame:  Lazy representation of the new data.
+        cursor: JSON-serialisable value representing what was consumed.
+                Passed back as ``since`` on the next :meth:`Source.poll` call.
+                ``None`` means the source always does a full refresh.
+    """
+
+    frame: pl.LazyFrame
+    cursor: object
+
+
+@runtime_checkable
+class Source(Protocol):
+    """Protocol for incremental data sources.
+
+    Implement ``poll`` to teach :class:`IncrementalPipeline` how to fetch new
+    data and what cursor to store so the next run picks up where this one left
+    off.
+    """
+
+    def poll(self, since: object | None) -> Batch | None:
+        """Return new data since *since*, or ``None`` when up to date.
+
+        Args:
+            since: The cursor saved by the previous run, or ``None`` on first run.
+
+        Returns:
+            A :class:`Batch` with the new data and the next cursor,
+            or ``None`` if nothing has changed since *since*.
+        """
+        ...
+
+
+class QuerySource:
+    """Source driven by a user function and a column high-water-mark cursor.
+
+    The function receives the last cursor value (or ``None`` on first run) and
+    should return a :class:`~polars.LazyFrame` containing only rows that are
+    new since that cursor, or ``None`` if there is nothing new.  The next
+    cursor is computed as the maximum value of *cursor_on* in the returned
+    frame.
+
+    .. note::
+        The frame is collected once to extract the cursor max — suitable for
+        HTTP/API sources where the full result fits in memory.  For large
+        file-based sources prefer implementing :class:`Source` directly.
+    """
+
+    def __init__(
+        self,
+        fn: Callable[[object | None], pl.LazyFrame | None],
+        cursor_on: str,
+    ) -> None:
+        self._fn = fn
+        self._cursor_on = cursor_on
+
+    def poll(self, since: object | None) -> Batch | None:
+        lf = self._fn(since)
+        if lf is None:
+            return None
+        df = cast(pl.DataFrame, lf.collect())
+        cursor = df[self._cursor_on].max()
+        if cursor is None:
+            return None
+        return Batch(frame=df.lazy(), cursor=cursor)
+
+
+class FrameSource:
+    """Source that returns the result of a no-argument factory on every run.
+
+    The cursor is never advanced, so ``run()`` always ingests the full result.
+    Requires ``merge_on`` — without it every run appends a duplicate copy.
+    """
+
+    def __init__(self, fn: Callable[[], pl.LazyFrame]) -> None:
+        self._fn = fn
+
+    def poll(self, since: object | None) -> Batch | None:  # noqa: ARG002
+        return Batch(frame=self._fn(), cursor=None)
+
+
+def from_query(
+    fn: Callable[[object | None], pl.LazyFrame | None],
+    cursor_on: str,
+) -> QuerySource:
+    """Create a :class:`QuerySource` driven by *fn* and a column high-water-mark.
+
+    Args:
+        fn:        Called with the last cursor (or ``None``) each run.
+                   Return a :class:`~polars.LazyFrame` of new rows, or ``None``
+                   when there is nothing new.
+        cursor_on: Column whose ``max`` value becomes the next cursor.
+
+    Example:
+        HTTP source that skips re-processing the same month::
+
+            def fetch_prices(since: str | None) -> pl.LazyFrame | None:
+                stamp = datetime.now().strftime("%Y%m")
+                if since == stamp:
+                    return None
+                resp = httpx.get("https://api.example.com/prices.csv")
+                return pl.scan_csv(io.BytesIO(resp.content)).with_columns(
+                    pl.lit(stamp).alias("_stamp")
+                )
+
+            @incremental(
+                source=from_query(fetch_prices, cursor_on="_stamp"),
+                target="/data/delta/prices",
+                merge_on="id",
+            )
+            def prices(lf: pl.LazyFrame) -> pl.LazyFrame:
+                return lf.drop("_stamp")
+    """
+    return QuerySource(fn, cursor_on)
+
+
+def from_frame(fn: Callable[[], pl.LazyFrame]) -> FrameSource:
+    """Create a :class:`FrameSource` that calls *fn* on every run (full refresh).
+
+    Requires ``merge_on`` — without it every run appends a duplicate copy of
+    the data.
+
+    Args:
+        fn: No-argument factory that returns a :class:`~polars.LazyFrame`.
+    """
+    return FrameSource(fn)
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 
 def incremental(
-    source: str | list[str],
+    source: str | list[str] | Source,
     target: str,
     merge_on: str | list[str] | None = None,
     file_format: FileFormat = "parquet",
@@ -367,7 +533,7 @@ class IncrementalPipeline:
     def __init__(
         self,
         fn: Callable[..., pl.LazyFrame],
-        source: str | list[str],
+        source: str | list[str] | Source,
         target: str,
         merge_on: str | list[str] | None = None,
         file_format: FileFormat = "parquet",
@@ -407,10 +573,17 @@ class IncrementalPipeline:
         self.reader_kwargs = reader_kwargs
         self.concat_options = concat_options
 
-        # Derived attributes computed once.
-        self._sources: list[str] = [source] if isinstance(source, str) else list(source)
-        self._suffix: str = _SUFFIXES.get(file_format, "")
-        self._suffixes: tuple[str, ...] = (self._suffix,) if self._suffix else ()
+        # Derived attributes computed once — differ for custom vs path-based sources.
+        if isinstance(source, Source):
+            self._custom_source: Source | None = source
+            self._sources: list[str] = []
+            self._suffix: str = ""
+            self._suffixes: tuple[str, ...] = ()
+        else:
+            self._custom_source = None
+            self._sources = [source] if isinstance(source, str) else list(source)
+            self._suffix = _SUFFIXES.get(file_format, "")
+            self._suffixes = (self._suffix,) if self._suffix else ()
 
         # Preserve wrapped function metadata.
         self.__wrapped__ = fn
@@ -450,14 +623,17 @@ class IncrementalPipeline:
         return frames
 
     def run(self, dry_run: bool = False) -> list[str]:
-        """Ingest new files, apply the transform, write to the target, and save the watermark.
+        """Ingest new data, apply the transform, write to the target, and save the watermark.
 
         Args:
-            dry_run: Log new files without reading or writing. Returns the same file list.
+            dry_run: Log what would be processed without reading or writing.
 
         Returns:
-            Processed file paths, or ``["v{version}"]`` for ``file_format="delta"``.
+            Processed file paths, ``["v{version}"]`` for ``file_format="delta"``,
+            or ``[cursor_repr]`` for custom :class:`Source` instances.
         """
+        if self._custom_source is not None:
+            return self._run_custom(dry_run)
         if self.file_format == "delta":
             return self._run_delta(dry_run)
 
@@ -507,6 +683,58 @@ class IncrementalPipeline:
 
         logger.info("Processed %d file(s).", len(new_files))
         return new_files
+
+    def _run_custom(self, dry_run: bool) -> list[str]:
+        """Run one increment via a custom :class:`Source`; return ``[cursor]`` or ``[]``."""
+        assert self._custom_source is not None
+        cursor = _load_json_cursor(self.watermark_store)
+        batch = self._custom_source.poll(cursor)
+
+        if batch is None:
+            logger.info("Source up to date — nothing to do.")
+            return []
+
+        cursor_repr = str(batch.cursor)[:100]
+        logger.info("Custom source has new data (cursor → %s).", cursor_repr)
+
+        if dry_run:
+            logger.info("  [dry_run] %s", cursor_repr)
+            return [cursor_repr]
+
+        result_lf = self.fn(batch.frame)
+
+        if self.compute_context is not None:
+            from .cloud import _sink_target_remote  # noqa: PLC0415
+
+            _sink_target_remote(
+                self.target,
+                result_lf,
+                self.merge_on,
+                self.compute_context,
+                self.partition_by,
+            )
+        elif self.scd_type == 2:
+            assert self.merge_on is not None, "merge_on is required for scd_type=2"
+            _sink_scd2(self.target, result_lf, self.merge_on, self.partition_by)
+        elif self.scd_type == 4:
+            assert self.merge_on is not None, "merge_on is required for scd_type=4"
+            assert self.history_target is not None
+            _sink_scd4(
+                self.target, self.history_target, result_lf, self.merge_on, self.partition_by
+            )
+        else:
+            _sink_target(self.target, result_lf, self.merge_on, self.partition_by)
+
+        _save_json_cursor(self.watermark_store, batch.cursor)
+
+        if self.compact_every is not None:
+            count = _load_run_count(self.watermark_store) + 1
+            _save_run_count(self.watermark_store, count)
+            if count % self.compact_every == 0:
+                maintain(self.target)
+
+        logger.info("Custom source batch committed (cursor=%s).", cursor_repr)
+        return [cursor_repr]
 
     def _run_delta(self, dry_run: bool) -> list[str]:
         """Run one Delta CDF increment; return ``["v{version}"]`` or ``[]`` when up to date."""

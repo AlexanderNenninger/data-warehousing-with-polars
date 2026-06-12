@@ -111,7 +111,7 @@ def _sink_scd4(
     )
 
     _raw = lf.collect()
-    df = cast(pl.DataFrame, _raw)
+    df = cast(pl.DataFrame, _raw).unique(subset=keys, keep="last")
 
     try:
         dt = DeltaTable(target)

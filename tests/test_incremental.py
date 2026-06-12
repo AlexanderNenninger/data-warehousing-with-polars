@@ -4,8 +4,14 @@ import polars as pl
 import pytest
 
 from data_warehousing_with_polars.incremental import (
+    Batch,
+    FrameSource,
     IncrementalPipeline,
+    QuerySource,
+    Source,
     _list_local_files,
+    from_frame,
+    from_query,
     incremental,
 )
 
@@ -271,4 +277,138 @@ def test_merge_on_none():
     def test_pipeline(lf: pl.LazyFrame) -> pl.LazyFrame:
         return lf
 
-    assert test_pipeline.merge_on is None
+
+# ── Source protocol tests ─────────────────────────────────────────────────────
+
+
+def test_from_query_returns_query_source():
+    src = from_query(lambda since: None, cursor_on="updated_at")
+    assert isinstance(src, QuerySource)
+    assert isinstance(src, Source)
+
+
+def test_from_frame_returns_frame_source():
+    src = from_frame(lambda: pl.DataFrame({"id": [1]}).lazy())
+    assert isinstance(src, FrameSource)
+    assert isinstance(src, Source)
+
+
+def test_query_source_poll_returns_none_when_fn_returns_none():
+    src = from_query(lambda since: None, cursor_on="ts")
+    assert src.poll(None) is None
+    assert src.poll("2024-01") is None
+
+
+def test_query_source_poll_returns_batch_with_cursor():
+    data = pl.DataFrame({"id": [1, 2], "ts": ["2024-01-01", "2024-01-02"]})
+    src = from_query(lambda since: data.lazy(), cursor_on="ts")
+    batch = src.poll(None)
+    assert batch is not None
+    assert isinstance(batch, Batch)
+    assert batch.cursor == "2024-01-02"
+    assert isinstance(batch.frame, pl.LazyFrame)
+
+
+def test_query_source_cursor_filters_correctly():
+    calls: list[object] = []
+
+    def fetch(since: object) -> pl.LazyFrame | None:
+        calls.append(since)
+        if since == "2024-01-02":
+            return None
+        return pl.DataFrame({"id": [1], "ts": ["2024-01-02"]}).lazy()
+
+    src = from_query(fetch, cursor_on="ts")
+    batch = src.poll(None)
+    assert batch is not None
+    assert batch.cursor == "2024-01-02"
+
+    result = src.poll(batch.cursor)
+    assert result is None
+    assert calls == [None, "2024-01-02"]
+
+
+def test_frame_source_always_returns_batch():
+    df = pl.DataFrame({"id": [1, 2]})
+    src = from_frame(lambda: df.lazy())
+
+    b1 = src.poll(None)
+    b2 = src.poll("anything")
+    assert b1 is not None
+    assert b2 is not None
+    assert b1.cursor is None
+    assert b2.cursor is None
+
+
+def test_incremental_accepts_custom_source():
+    src = from_query(lambda since: None, cursor_on="ts")
+
+    @incremental(source=src, target="/tmp/output/")
+    def pipeline(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf
+
+    assert isinstance(pipeline, IncrementalPipeline)
+    assert pipeline._custom_source is src
+    assert pipeline._sources == []
+    assert pipeline._suffixes == ()
+
+
+def test_incremental_custom_source_run_returns_empty_when_up_to_date(tmp_path):
+    src = from_query(lambda since: None, cursor_on="ts")
+
+    @incremental(source=src, target=str(tmp_path / "target"))
+    def pipeline(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf
+
+    result = pipeline.run()
+    assert result == []
+
+
+def test_incremental_custom_source_run_dry_run(tmp_path):
+    data = pl.DataFrame({"id": [1], "ts": ["2024-06"]})
+    src = from_query(lambda since: data.lazy(), cursor_on="ts")
+
+    @incremental(source=src, target=str(tmp_path / "target"))
+    def pipeline(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf
+
+    result = pipeline.run(dry_run=True)
+    assert result == ["2024-06"]
+    assert not (tmp_path / "target").exists()
+
+
+def test_incremental_from_query_end_to_end(tmp_path):
+    """from_query source ingests data, saves cursor, skips on second run."""
+    call_count = [0]
+
+    def fetch(since: object) -> pl.LazyFrame | None:
+        call_count[0] += 1
+        if since == "2024-01-03":
+            return None
+        return (
+            pl.DataFrame(
+                {
+                    "id": [1, 2, 3],
+                    "ts": ["2024-01-01", "2024-01-02", "2024-01-03"],
+                    "value": [10.0, 20.0, 30.0],
+                }
+            )
+            .lazy()
+            .filter(pl.col("ts") > (since or "1970-01-01"))
+        )
+
+    @incremental(
+        source=from_query(fetch, cursor_on="ts"),
+        target=str(tmp_path / "target"),
+        merge_on="id",
+    )
+    def pipeline(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf
+
+    result = pipeline.run()
+    assert result == ["2024-01-03"]
+    assert call_count[0] == 1
+
+    result2 = pipeline.run()
+    assert result2 == []
+    assert call_count[0] == 2

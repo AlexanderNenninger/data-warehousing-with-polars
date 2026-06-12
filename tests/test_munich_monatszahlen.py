@@ -24,10 +24,8 @@ from munich_monatszahlen import (  # noqa: E402
     _URLS,
     CKAN_API,
     SCHEMA_MONATSZAHLEN,
-    _already_processed,
     _fetch_ckan_url,
-    _ingest,
-    _save_stamp,
+    _make_source,
     _transform,
 )
 
@@ -189,38 +187,39 @@ def test_transform_preserves_wert(sample_df):
 
 
 # ---------------------------------------------------------------------------
-# _already_processed / _save_stamp (integration with local Delta)
+# _make_source — cursor / poll behaviour
 # ---------------------------------------------------------------------------
 
 
-def test_already_processed_returns_false_when_no_table(tmp_path):
-    """Return False when the watermark table does not yet exist."""
-    store = str(tmp_path / "watermark")
-    assert _already_processed(store, "202501") is False
+def test_make_source_skips_current_stamp():
+    """poll returns None when cursor matches the current YYYYMM stamp."""
+    stamp = datetime.now().strftime("%Y%m")
+    src = _make_source("accidents")
+    assert src.poll(stamp) is None
 
 
-def test_save_and_check_stamp(tmp_path):
-    """A stamp saved via _save_stamp must be found by _already_processed."""
-    store = str(tmp_path / "watermark")
-    _save_stamp(store, "202501", rows=42)
-    assert _already_processed(store, "202501") is True
+def test_make_source_returns_batch_for_old_stamp(tmp_path, sample_df):
+    """poll returns a Batch with a _stamp column when the cursor is stale."""
+    csv_path = tmp_path / "test.csv"
+    sample_df.write_csv(csv_path)
+    src = _make_source("accidents")
+    with patch("munich_monatszahlen._download", return_value=csv_path):
+        batch = src.poll("202001")
+    assert batch is not None
+    stamp = datetime.now().strftime("%Y%m")
+    assert batch.cursor == stamp
+    assert "_stamp" in batch.frame.collect().columns
 
 
-def test_different_stamp_not_found(tmp_path):
-    """A different stamp must not be found after saving an unrelated stamp."""
-    store = str(tmp_path / "watermark")
-    _save_stamp(store, "202501", rows=10)
-    assert _already_processed(store, "202412") is False
-
-
-def test_save_stamp_multiple_months(tmp_path):
-    """Multiple distinct stamps can be stored and queried independently."""
-    store = str(tmp_path / "watermark")
-    _save_stamp(store, "202501", rows=1)
-    _save_stamp(store, "202502", rows=2)
-    assert _already_processed(store, "202501") is True
-    assert _already_processed(store, "202502") is True
-    assert _already_processed(store, "202503") is False
+def test_make_source_returns_batch_on_first_run(tmp_path, sample_df):
+    """poll returns a Batch when since=None (initial load)."""
+    csv_path = tmp_path / "test.csv"
+    sample_df.write_csv(csv_path)
+    src = _make_source("accidents")
+    with patch("munich_monatszahlen._download", return_value=csv_path):
+        batch = src.poll(None)
+    assert batch is not None
+    assert batch.cursor == datetime.now().strftime("%Y%m")
 
 
 # ---------------------------------------------------------------------------
@@ -312,35 +311,30 @@ def test_fetch_ckan_url_raises_when_no_csv():
 
 
 # ---------------------------------------------------------------------------
-# _ingest — smoke test with local Delta (no S3, no network)
+# Pipeline integration — smoke test with local Delta (no S3, no network)
 # ---------------------------------------------------------------------------
 
 
-def test_ingest_skips_when_already_processed(tmp_path, sample_df):
-    """_ingest must return 0 without downloading when the stamp exists."""
-    target = str(tmp_path / "delta_table")
-    stamp = datetime.now().strftime("%Y%m")
-    _save_stamp(target + "/.stamp", stamp, rows=99)
+def test_pipeline_processes_and_skips_on_rerun(tmp_path, sample_df):
+    """Pipeline writes data on first run and skips on the second (same month)."""
+    from data_warehousing_with_polars import incremental
 
-    # Patch _download so any accidental call raises.
-    with patch("munich_monatszahlen._download", side_effect=AssertionError("should not download")):
-        result = _ingest("accidents", target)
-
-    assert result == 0
-
-
-def test_ingest_processes_new_data(tmp_path, sample_df):
-    """_ingest must write rows to Delta and save a watermark stamp."""
-    target = str(tmp_path / "delta_table")
     csv_path = tmp_path / "test_data.csv"
     sample_df.write_csv(csv_path)
+    target = str(tmp_path / "delta")
+
+    @incremental(
+        source=_make_source("accidents"),
+        target=target,
+        merge_on=_NATURAL_KEYS,
+    )
+    def test_pipe(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf.drop("_stamp")
 
     with patch("munich_monatszahlen._download", return_value=csv_path):
-        rows_written = _ingest("accidents", target)
+        result1 = test_pipe.run()
 
-    # 4 input rows → 2 after transform (Summe dropped, duplicate collapsed).
-    assert rows_written == 2
+    assert len(result1) > 0
 
-    # Watermark must now prevent re-processing.
-    stamp = datetime.now().strftime("%Y%m")
-    assert _already_processed(target + "/.stamp", stamp) is True
+    result2 = test_pipe.run()
+    assert result2 == []
