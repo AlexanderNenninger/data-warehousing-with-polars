@@ -18,14 +18,20 @@ License: [Datenlizenz Deutschland – Namensnennung 2.0](https://www.govdata.de/
 
 ```{python}
 #| echo: false
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    print("python-dotenv not found, skipping .env loading") 
+```
+
+```{python}
+#| echo: false
 import os
 from pathlib import Path
 
 import altair as alt
 import polars as pl
-from dotenv import load_dotenv
-
-load_dotenv()
 
 BUCKET = os.environ.get("MUNICH_CYCLING_BUCKET", "data-warehousing-with-polars")
 ```
