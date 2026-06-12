@@ -1,11 +1,21 @@
 """Tests for incremental module."""
 
+from typing import Literal, cast
+
 import polars as pl
 import pytest
 
 from data_warehousing_with_polars.incremental import (
+    Batch,
+    FrameSource,
     IncrementalPipeline,
+    QuerySource,
+    Source,
+    _DeltaCdfSource,
+    _DirSource,
     _list_local_files,
+    from_frame,
+    from_query,
     incremental,
 )
 
@@ -64,11 +74,12 @@ def test_incremental_fan_in_source():
         return lf
 
     assert test_pipeline.source == ["/tmp/input1/", "/tmp/input2/"]
-    assert test_pipeline._sources == ["/tmp/input1/", "/tmp/input2/"]
+    assert len(test_pipeline._sources) == 2
+    assert all(isinstance(s, _DirSource) for s in test_pipeline._sources)
 
 
 def test_incremental_delta_format():
-    """Test that file_format='delta' is accepted and has no suffix."""
+    """Test that file_format='delta' wraps the source as a Delta CDF source."""
 
     @incremental(
         source="/tmp/delta_source/",
@@ -80,7 +91,8 @@ def test_incremental_delta_format():
         return lf
 
     assert test_pipeline.file_format == "delta"
-    assert test_pipeline._suffixes == ()
+    assert len(test_pipeline._sources) == 1
+    assert isinstance(test_pipeline._sources[0], _DeltaCdfSource)
 
 
 def test_incremental_with_partition_by():
@@ -214,7 +226,8 @@ def test_file_format_csv():
         return lf
 
     assert test_pipeline.file_format == "csv"
-    assert test_pipeline._suffix == ".csv"
+    assert isinstance(test_pipeline._sources[0], _DirSource)
+    assert test_pipeline._sources[0]._suffixes == (".csv",)
 
 
 def test_file_format_ndjson():
@@ -229,7 +242,8 @@ def test_file_format_ndjson():
         return lf
 
     assert test_pipeline.file_format == "ndjson"
-    assert test_pipeline._suffix == ".ndjson"
+    assert isinstance(test_pipeline._sources[0], _DirSource)
+    assert test_pipeline._sources[0]._suffixes == (".ndjson",)
 
 
 def test_merge_on_string():
@@ -271,4 +285,269 @@ def test_merge_on_none():
     def test_pipeline(lf: pl.LazyFrame) -> pl.LazyFrame:
         return lf
 
-    assert test_pipeline.merge_on is None
+
+# ── Source protocol tests ─────────────────────────────────────────────────────
+
+
+def test_from_query_returns_query_source():
+    src = from_query(lambda since: None, cursor_on="updated_at")
+    assert isinstance(src, QuerySource)
+    assert isinstance(src, Source)
+
+
+def test_from_frame_returns_frame_source():
+    src = from_frame(lambda: pl.DataFrame({"id": [1]}).lazy())
+    assert isinstance(src, FrameSource)
+    assert isinstance(src, Source)
+
+
+def test_query_source_poll_returns_none_when_fn_returns_none():
+    src = from_query(lambda since: None, cursor_on="ts")
+    assert src.poll(None) is None
+    assert src.poll("2024-01") is None
+
+
+def test_query_source_poll_returns_batch_with_cursor():
+    data = pl.DataFrame({"id": [1, 2], "ts": ["2024-01-01", "2024-01-02"]})
+    src = from_query(lambda since: data.lazy(), cursor_on="ts")
+    batch = src.poll(None)
+    assert batch is not None
+    assert isinstance(batch, Batch)
+    assert batch.cursor == "2024-01-02"
+    assert isinstance(batch.frame, pl.LazyFrame)
+
+
+def test_query_source_cursor_filters_correctly():
+    calls: list[object] = []
+
+    def fetch(since: object) -> pl.LazyFrame | None:
+        calls.append(since)
+        if since == "2024-01-02":
+            return None
+        return pl.DataFrame({"id": [1], "ts": ["2024-01-02"]}).lazy()
+
+    src = from_query(fetch, cursor_on="ts")
+    batch = src.poll(None)
+    assert batch is not None
+    assert batch.cursor == "2024-01-02"
+
+    result = src.poll(batch.cursor)
+    assert result is None
+    assert calls == [None, "2024-01-02"]
+
+
+def test_frame_source_always_returns_batch():
+    df = pl.DataFrame({"id": [1, 2]})
+    src = from_frame(lambda: df.lazy())
+
+    b1 = src.poll(None)
+    b2 = src.poll("anything")
+    assert b1 is not None
+    assert b2 is not None
+    assert b1.cursor is None
+    assert b2.cursor is None
+
+
+def test_incremental_accepts_custom_source():
+    src = from_query(lambda since: None, cursor_on="ts")
+
+    @incremental(source=src, target="/tmp/output/")
+    def pipeline(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf
+
+    assert isinstance(pipeline, IncrementalPipeline)
+    assert pipeline._sources == [src]
+
+
+def test_incremental_custom_source_run_returns_empty_when_up_to_date(tmp_path):
+    src = from_query(lambda since: None, cursor_on="ts")
+
+    @incremental(source=src, target=str(tmp_path / "target"))
+    def pipeline(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf
+
+    result = pipeline.run()
+    assert result == []
+
+
+def test_incremental_custom_source_run_dry_run(tmp_path):
+    data = pl.DataFrame({"id": [1], "ts": ["2024-06"]})
+    src = from_query(lambda since: data.lazy(), cursor_on="ts")
+
+    @incremental(source=src, target=str(tmp_path / "target"))
+    def pipeline(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf
+
+    result = pipeline.run(dry_run=True)
+    assert result == ["2024-06"]
+    assert not (tmp_path / "target").exists()
+
+
+def test_incremental_from_query_end_to_end(tmp_path):
+    """from_query source ingests data, saves cursor, skips on second run."""
+    call_count = [0]
+
+    def fetch(since: object) -> pl.LazyFrame | None:
+        call_count[0] += 1
+        if since == "2024-01-03":
+            return None
+        return (
+            pl.DataFrame(
+                {
+                    "id": [1, 2, 3],
+                    "ts": ["2024-01-01", "2024-01-02", "2024-01-03"],
+                    "value": [10.0, 20.0, 30.0],
+                }
+            )
+            .lazy()
+            .filter(pl.col("ts") > (since or "1970-01-01"))
+        )
+
+    @incremental(
+        source=from_query(fetch, cursor_on="ts"),
+        target=str(tmp_path / "target"),
+        merge_on="id",
+    )
+    def pipeline(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf
+
+    result = pipeline.run()
+    assert result == ["2024-01-03"]
+    assert call_count[0] == 1
+
+    result2 = pipeline.run()
+    assert result2 == []
+    assert call_count[0] == 2
+
+
+# ── Fan-in across source types ─────────────────────────────────────────────────
+
+
+def _write_delta_cdf(path, df: pl.DataFrame, mode: Literal["append", "overwrite"]) -> None:
+    """Write *df* to a Delta table at *path* with Change Data Feed enabled."""
+    from deltalake import write_deltalake
+
+    write_deltalake(
+        str(path),
+        df.to_arrow(),
+        mode=mode,
+        configuration={"delta.enableChangeDataFeed": "true"},
+    )
+
+
+def test_fan_in_dirs_end_to_end(tmp_path):
+    """Two directory sources fan in; the transform receives one frame per source."""
+    src_a = tmp_path / "a"
+    src_b = tmp_path / "b"
+    src_a.mkdir()
+    src_b.mkdir()
+    pl.DataFrame({"id": [1], "v": [10.0]}).write_parquet(src_a / "f.parquet")
+    pl.DataFrame({"id": [2], "v": [20.0]}).write_parquet(src_b / "f.parquet")
+
+    @incremental(source=[str(src_a), str(src_b)], target=str(tmp_path / "t"), merge_on="id")
+    def pipe(*lfs: pl.LazyFrame) -> pl.LazyFrame:
+        assert len(lfs) == 2
+        return pl.concat(lfs).select("id", "v")
+
+    result = pipe.run()
+    assert len(result) == 2  # one new file per source
+
+    out = cast(pl.DataFrame, pl.scan_delta(str(tmp_path / "t")).collect())
+    assert set(out["id"].to_list()) == {1, 2}
+
+    assert pipe.run() == []  # nothing new on rerun
+
+
+def test_fan_in_delta_sources(tmp_path):
+    """Two Delta sources fan in with independent per-source version cursors."""
+    src_a = tmp_path / "da"
+    src_b = tmp_path / "db"
+    _write_delta_cdf(src_a, pl.DataFrame({"id": [1], "v": [10]}), "overwrite")
+    _write_delta_cdf(src_b, pl.DataFrame({"id": [2], "v": [20]}), "overwrite")
+
+    @incremental(
+        source=[str(src_a), str(src_b)],
+        target=str(tmp_path / "t"),
+        merge_on="id",
+        file_format="delta",
+    )
+    def pipe(*lfs: pl.LazyFrame) -> pl.LazyFrame:
+        return pl.concat([lf.select("id", "v") for lf in lfs])
+
+    result = pipe.run()
+    assert len(result) == 2  # both sources had an initial version
+    assert set(
+        cast(pl.DataFrame, pl.scan_delta(str(tmp_path / "t")).collect())["id"].to_list()
+    ) == {1, 2}
+
+    assert pipe.run() == []  # neither source advanced
+
+    # Advance only src_a — only its frame should arrive on the next run.
+    _write_delta_cdf(src_a, pl.DataFrame({"id": [3], "v": [30]}), "append")
+    result3 = pipe.run()
+    assert len(result3) == 1
+    assert set(
+        cast(pl.DataFrame, pl.scan_delta(str(tmp_path / "t")).collect())["id"].to_list()
+    ) == {1, 2, 3}
+
+
+def test_fan_in_custom_sources(tmp_path):
+    """Two custom Sources fan in; an idle source is omitted from the transform args."""
+    a_calls: list[object] = []
+
+    def fetch_a(since: object) -> pl.LazyFrame | None:
+        a_calls.append(since)
+        nxt = "2024-02" if since is None else "2024-03"
+        if since == "2024-03":
+            return None
+        return pl.DataFrame({"id": [len(a_calls)], "ts": [nxt]}).lazy()
+
+    def fetch_b(since: object) -> pl.LazyFrame | None:
+        if since is not None:
+            return None  # only ever yields on the first run
+        return pl.DataFrame({"id": [100], "ts": ["2024-02"]}).lazy()
+
+    @incremental(
+        source=[from_query(fetch_a, cursor_on="ts"), from_query(fetch_b, cursor_on="ts")],
+        target=str(tmp_path / "t"),
+        merge_on="id",
+    )
+    def pipe(*lfs: pl.LazyFrame) -> pl.LazyFrame:
+        return pl.concat([lf.select("id", "ts") for lf in lfs])
+
+    r1 = pipe.run()
+    assert len(r1) == 2  # both sources produced data
+
+    r2 = pipe.run()  # b is idle now, a still advances
+    assert len(r2) == 1
+
+    out = cast(pl.DataFrame, pl.scan_delta(str(tmp_path / "t")).collect())
+    assert 100 in out["id"].to_list()
+
+
+def test_fan_in_mixed_dir_and_custom(tmp_path):
+    """A directory source and a custom Source fan in together."""
+    src_dir = tmp_path / "dir"
+    src_dir.mkdir()
+    pl.DataFrame({"id": [1], "ts": ["2024-01"]}).write_parquet(src_dir / "f.parquet")
+
+    def fetch(since: object) -> pl.LazyFrame | None:
+        if since == "2024-05":
+            return None
+        return pl.DataFrame({"id": [2], "ts": ["2024-05"]}).lazy()
+
+    @incremental(
+        source=[str(src_dir), from_query(fetch, cursor_on="ts")],
+        target=str(tmp_path / "t"),
+        merge_on="id",
+    )
+    def pipe(*lfs: pl.LazyFrame) -> pl.LazyFrame:
+        return pl.concat([lf.select("id", "ts") for lf in lfs])
+
+    result = pipe.run()
+    assert len(result) == 2  # one new file + one custom cursor
+
+    out = cast(pl.DataFrame, pl.scan_delta(str(tmp_path / "t")).collect())
+    assert set(out["id"].to_list()) == {1, 2}
+
+    assert pipe.run() == []  # both sources up to date

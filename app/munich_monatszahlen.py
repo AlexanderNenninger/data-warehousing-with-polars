@@ -22,11 +22,10 @@ Five pipelines (all use the same "Monatszahlen Monitoring" CSV schema):
                 open job postings for Munich.
 
 Each source is a **single full-history CSV** that the data portal replaces
-in-place every month.  Because the authoritative source is always the latest
-complete file, the correct write strategy is *overwrite* rather than *merge*:
-each monthly run downloads the file, transforms and deduplicates the data, and
-atomically replaces the Delta table.  A lightweight month-stamp watermark stored
-alongside the table prevents duplicate processing within the same calendar month.
+in-place every month.  The pipeline uses :func:`from_query` with a YYYYMM
+stamp cursor: the fetch function downloads the file and returns ``None`` if the
+current month has already been processed.  :func:`incremental` stores the stamp
+in its watermark table; the next run compares it to avoid duplicate downloads.
 
 The three original datasets (accidents, airport, vehicles) use stable hardcoded
 download URLs.  The two newer datasets (tourism, labor) look up their current
@@ -50,13 +49,18 @@ from __future__ import annotations
 import json
 import logging
 import os
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
 
 import polars as pl
-from deltalake import write_deltalake
+from dotenv import load_dotenv
+
+from data_warehousing_with_polars import from_query, incremental
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -132,78 +136,11 @@ def _transform(df: pl.DataFrame, source_path: str) -> pl.DataFrame:
     return cast(pl.DataFrame, result)
 
 
-# ── Watermark helpers ─────────────────────────────────────────────────────────
-
-
-def _already_processed(watermark_store: str, stamp: str) -> bool:
-    """Return True if *stamp* (YYYYMM) is recorded in the watermark table."""
-    try:
-        collected = cast(pl.DataFrame, pl.scan_delta(watermark_store).select("stamp").collect())
-        stamps = collected["stamp"].to_list()
-        return stamp in stamps
-    except Exception:
-        return False
-
-
-def _save_stamp(watermark_store: str, stamp: str, rows: int) -> None:
-    """Append *stamp* with metadata to the watermark table."""
-    wm = pl.DataFrame(
-        {
-            "stamp": [stamp],
-            "written_at": [datetime.now(timezone.utc)],
-            "rows": [rows],
-        }
-    )
-    write_deltalake(watermark_store, wm.to_arrow(), mode="append")
-
-
-# ── Full-history ingest ───────────────────────────────────────────────────────
-
-
-def _ingest(name: str, target: str) -> int:
-    """Download, transform, and atomically overwrite the Delta table for *name*.
-
-    Because the source is a full-history file replaced monthly, the correct
-    write strategy is overwrite rather than merge: the latest published CSV is
-    the authoritative version of the complete dataset.
-
-    Returns the number of rows written, or 0 if this month's data was already
-    ingested.
-    """
-    stamp = datetime.now().strftime("%Y%m")
-    watermark_store = target + "/.stamp"
-
-    if _already_processed(watermark_store, stamp):
-        logger.info("[%s] Already processed for %s — skipping.", name, stamp)
-        return 0
-
-    csv_path = _download(name)
-
-    df_raw = pl.read_csv(
-        str(csv_path), schema_overrides=SCHEMA_MONATSZAHLEN, null_values=["NA"], quote_char='"'
-    )
-    logger.info("[%s] Raw CSV: %d rows.", name, len(df_raw))
-
-    df = _transform(df_raw, str(csv_path))
-    logger.info("[%s] After transform: %d rows.", name, len(df))
-
-    write_deltalake(target, df.to_arrow(), mode="overwrite")
-    _save_stamp(watermark_store, stamp, len(df))
-
-    logger.info("[%s] Overwrite complete — %d rows written.", name, len(df))
-    return len(df)
-
-
 # ── Download helper ───────────────────────────────────────────────────────────
 
 
 def _fetch_ckan_url(package_slug: str) -> str:
-    """Return the first CSV download URL from the Munich Open Data CKAN API.
-
-    Used for datasets whose filenames change with each monthly update so that
-    the pipeline always downloads the current version without requiring manual
-    URL updates.
-    """
+    """Return the first CSV download URL from the Munich Open Data CKAN API."""
     url = CKAN_API.format(package=package_slug)
     req = urllib.request.Request(url, headers={"User-Agent": "data-warehousing-with-polars-demo"})
     with urllib.request.urlopen(req, timeout=30) as resp:
@@ -218,12 +155,7 @@ def _fetch_ckan_url(package_slug: str) -> str:
 
 
 def _download(name: str) -> Path:
-    """Download the named Monatszahlen CSV into a date-stamped staging file.
-
-    URL resolution order:
-    1. ``_URLS`` — stable hardcoded URLs for datasets whose filenames never change.
-    2. ``_CKAN_SLUGS`` — CKAN API lookup for datasets with date-stamped filenames.
-    """
+    """Download the named Monatszahlen CSV into a date-stamped staging file."""
     dest_dir = _STAGING / name
     dest_dir.mkdir(parents=True, exist_ok=True)
 
@@ -248,20 +180,112 @@ def _download(name: str) -> Path:
     return dest
 
 
+# ── Source factories ──────────────────────────────────────────────────────────
+
+
+def _make_source(name: str):
+    """Return a ``from_query`` source for the named Monatszahlen dataset.
+
+    The cursor is a YYYYMM stamp.  ``poll`` returns ``None`` when the current
+    month has already been processed, otherwise downloads, transforms, and
+    returns the full-history LazyFrame with a ``_stamp`` column that drives the
+    cursor.  The pipeline transform drops ``_stamp`` before writing.
+    """
+
+    def _fetch(since: object | None) -> pl.LazyFrame | None:
+        stamp = datetime.now().strftime("%Y%m")
+        if since == stamp:
+            logger.info("[%s] Already processed for %s — skipping.", name, stamp)
+            return None
+        try:
+            csv_path = _download(name)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 503:
+                logger.warning("[%s] Portal returned 503 — treating as no new data.", name)
+                return None
+            raise
+        df_raw = pl.read_csv(
+            str(csv_path),
+            schema_overrides=SCHEMA_MONATSZAHLEN,
+            null_values=["NA"],
+            quote_char='"',
+        )
+        logger.info("[%s] Raw CSV: %d rows.", name, len(df_raw))
+        df = _transform(df_raw, str(csv_path))
+        logger.info("[%s] After transform: %d rows.", name, len(df))
+        return df.with_columns(pl.lit(stamp).alias("_stamp")).lazy()
+
+    return from_query(_fetch, cursor_on="_stamp")
+
+
+# ── Pipelines ─────────────────────────────────────────────────────────────────
+
+
+@incremental(
+    source=_make_source("accidents"),
+    target=f"s3://{BUCKET}/delta/munich_accidents",
+    history_target=f"s3://{BUCKET}/delta/munich_accidents_history",
+    merge_on=_NATURAL_KEYS,
+    scd_type=4,
+)
+def accidents(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf.drop("_stamp")
+
+
+@incremental(
+    source=_make_source("airport"),
+    target=f"s3://{BUCKET}/delta/munich_airport",
+    history_target=f"s3://{BUCKET}/delta/munich_airport_history",
+    merge_on=_NATURAL_KEYS,
+    scd_type=4,
+)
+def airport(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf.drop("_stamp")
+
+
+@incremental(
+    source=_make_source("vehicles"),
+    target=f"s3://{BUCKET}/delta/munich_vehicles",
+    history_target=f"s3://{BUCKET}/delta/munich_vehicles_history",
+    merge_on=_NATURAL_KEYS,
+    scd_type=4,
+)
+def vehicles(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf.drop("_stamp")
+
+
+@incremental(
+    source=_make_source("tourism"),
+    target=f"s3://{BUCKET}/delta/munich_tourism",
+    history_target=f"s3://{BUCKET}/delta/munich_tourism_history",
+    merge_on=_NATURAL_KEYS,
+    scd_type=4,
+)
+def tourism(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf.drop("_stamp")
+
+
+@incremental(
+    source=_make_source("labor"),
+    target=f"s3://{BUCKET}/delta/munich_labor",
+    history_target=f"s3://{BUCKET}/delta/munich_labor_history",
+    merge_on=_NATURAL_KEYS,
+    scd_type=4,
+)
+def labor(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf.drop("_stamp")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 
 def main() -> None:
-    for name, suffix in [
-        ("accidents", "munich_accidents"),
-        ("airport", "munich_airport"),
-        ("vehicles", "munich_vehicles"),
-        ("tourism", "munich_tourism"),
-        ("labor", "munich_labor"),
-    ]:
-        target = f"s3://{BUCKET}/delta/{suffix}"
-        n = _ingest(name, target)
-        logger.info("%s: %d rows ingested.", name, n)
+    for pipeline in [accidents, airport, vehicles, tourism, labor]:
+        result = pipeline.run()
+        if result:
+            logger.info("%s: ingested (cursor=%s).", pipeline.__name__, result[0])
+        else:
+            logger.info("%s: already up to date.", pipeline.__name__)
 
 
 if __name__ == "__main__":

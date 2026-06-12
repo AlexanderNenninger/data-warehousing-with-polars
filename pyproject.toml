@@ -36,6 +36,9 @@ dev = [
 [tool.ruff]
 line-length = 100
 
+[tool.ty.rules]
+redundant-cast = "ignore"
+
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
@@ -53,3 +56,12 @@ test_min_versions.sequence = [
     { cmd = "uv sync" },
 ]
 qa.sequence = ["fmt", "lint", "typecheck", "test", "test_memory"]
+
+# ── Pipelines ──────────────────────────────────────────────────────────────────
+monatszahlen = "python app/munich_monatszahlen.py"
+cycling = "python app/munich_cycling.py"
+pipelines.sequence = ["monatszahlen", "cycling"]
+
+# ── Docs ───────────────────────────────────────────────────────────────────────
+docs = "great-docs build"
+docs_preview = "great-docs preview"

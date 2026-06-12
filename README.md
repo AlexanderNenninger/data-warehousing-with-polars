@@ -58,6 +58,13 @@ def events(lf: pl.LazyFrame) -> pl.LazyFrame:
     return lf
 ```
 
+#### How upserts scale
+
+Upserts are applied by **rewriting only the data a batch touches**, never the whole table, and without using Delta `MERGE` (which mis-handles large match sets):
+
+- **Partitioned target** (`partition_by=` set) — only the partitions present in the incoming batch are rewritten (`replaceWhere`). A batch that lands in a few partitions costs the same regardless of how large the table is, so partitioned tables scale to arbitrary size. Partition by a column your batches are naturally bounded on (e.g. a date or region).
+- **Unpartitioned target** — the upsert reads the table, swaps the affected keys, and rewrites it in full. Correct at any size but **O(table)** per run; partition the target if write cost matters.
+
 ### SCD Type 2 — full row history
 
 `scd_type=2` keeps the complete history of every row. Each time a key reappears, the old row is closed (`is_current = false`, `valid_to = <now>`) and a new row is appended (`is_current = true`, `valid_to = null`).
@@ -115,9 +122,9 @@ def users(lf: pl.LazyFrame) -> pl.LazyFrame:
 
 The main table stays small and fast to query. The history table is append-only and accumulates one row per superseded version.
 
-### Fan-in — multiple source directories
+### Fan-in — multiple sources
 
-Pass a list of paths to `source` to read from multiple directories in a single run. Each source directory produces one `LazyFrame` argument; the transform receives them as positional arguments in the same order as `source`.
+Pass a list to `source` to read from multiple sources in a single run. Each source produces one `LazyFrame` argument; the transform receives them as positional arguments in the same order as `source`.
 
 ```python
 @incremental(
@@ -129,13 +136,27 @@ def combine(lf_a: pl.LazyFrame, lf_b: pl.LazyFrame) -> pl.LazyFrame:
     return pl.concat([lf_a, lf_b])
 ```
 
-Sources with no new files are omitted from the call, so the number of arguments can vary between runs. Use `*lfs` when the number of sources is not fixed:
+Sources with nothing new are omitted from the call, so the number of arguments can vary between runs. Use `*lfs` when the number of sources is not fixed:
 
 ```python
 @incremental(source=["/data/a/", "/data/b/", "/data/c/"], target="/data/delta/all", merge_on="id")
 def ingest(*lfs: pl.LazyFrame) -> pl.LazyFrame:
     return pl.concat(list(lfs))
 ```
+
+Fan-in works for **every source type**, each tracked by its own cursor: a list of Delta tables (with `file_format="delta"`), a list of custom `Source` objects, or a **mix** of directories and custom sources in one pipeline:
+
+```python
+@incremental(
+    source=["/data/uploads/", from_query(fetch_orders, cursor_on="updated_at")],
+    target="/data/delta/combined",
+    merge_on="id",
+)
+def combine(*lfs: pl.LazyFrame) -> pl.LazyFrame:
+    return pl.concat(list(lfs))
+```
+
+The one combination a single list can't express is directories *and* Delta tables together, because `file_format` applies to the whole pipeline — wrap one of them as a custom `Source` if you need that mix.
 
 ### Delta source — Change Data Feed
 
@@ -151,6 +172,78 @@ CDF metadata columns (`_change_type`, `_commit_version`, `_commit_timestamp`) ar
     file_format="delta",
 )
 def propagate(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf
+```
+
+### Custom sources — HTTP, APIs, and other transports
+
+File paths and Delta tables cover the common case, but some sources publish data over HTTP or behind an API. The `Source` protocol lets any object drive a pipeline as long as it implements `poll(since) -> Batch | None`.
+
+**`from_query`** — for sources that return a full snapshot on every call (e.g. a CSV downloaded from a URL). The cursor is the maximum value of a column you designate; `poll` returns `None` when the cursor hasn't advanced.
+
+```python
+import urllib.request
+import polars as pl
+from data_warehousing_with_polars import incremental, from_query
+
+
+def _fetch(since: object | None) -> pl.LazyFrame | None:
+    stamp = "202506"          # e.g. derived from current month
+    if since == stamp:
+        return None           # already up to date
+    with urllib.request.urlopen("https://example.com/data.csv") as r:
+        raw = pl.read_csv(r.read())
+    return raw.with_columns(pl.lit(stamp).alias("_stamp")).lazy()
+
+
+@incremental(
+    source=from_query(_fetch, cursor_on="_stamp"),
+    target="s3://my-bucket/delta/dataset",
+    merge_on="id",
+)
+def dataset(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf.drop("_stamp")
+
+
+dataset.run()
+```
+
+The cursor is JSON-serialised and stored in the watermark table. On the next run, `since` receives the value that was returned as `cursor`, so the fetch function can skip unchanged data.
+
+**`from_frame`** — for sources where the transform always re-reads the full frame (e.g. a slowly-changing reference file). The cursor never advances; `merge_on` prevents duplicates.
+
+```python
+from data_warehousing_with_polars import incremental, from_frame
+
+@incremental(
+    source=from_frame(lambda: pl.scan_csv("https://example.com/reference.csv")),
+    target="s3://my-bucket/delta/reference",
+    merge_on="id",
+)
+def reference(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf
+```
+
+**Direct `Source` implementation** — implement the protocol directly when the cursor needs custom logic, such as tracking a set of already-processed URLs:
+
+```python
+from data_warehousing_with_polars import incremental
+from data_warehousing_with_polars.incremental import Batch
+import polars as pl
+
+
+class MyApiSource:
+    def poll(self, since: object | None) -> Batch | None:
+        seen: set[str] = set(since) if isinstance(since, list) else set()
+        new_urls = [u for u in _list_api_urls() if u not in seen]
+        if not new_urls:
+            return None
+        lf = pl.concat([pl.scan_csv(u) for u in new_urls])
+        return Batch(frame=lf, cursor=sorted(seen | set(new_urls)))
+
+
+@incremental(source=MyApiSource(), target="s3://my-bucket/delta/data", merge_on="id")
+def data(lf: pl.LazyFrame) -> pl.LazyFrame:
     return lf
 ```
 
@@ -203,7 +296,7 @@ except SchemaError as e:
 
 ### Partitioning
 
-Pass `partition_by=` to partition the target table. Partitioning is fixed at table creation and improves query performance on large tables when filtering by the partition column.
+Pass `partition_by=` to partition the target table. Partitioning is fixed at table creation, improves query performance when filtering by the partition column, and — for `merge_on` upserts — bounds how much data each run rewrites (see [How upserts scale](#how-upserts-scale)). Partitioning is the lever for upserting into arbitrarily large tables.
 
 ```python
 @incremental(
@@ -251,6 +344,15 @@ poe lint         # ruff check --fix
 poe typecheck    # ty check
 poe test         # pytest (excludes memory tests)
 poe test_memory  # memory-boundedness tests (each in a fresh subprocess)
+
+# Demo pipelines (require AWS credentials in .env)
+poe monatszahlen   # munich_monatszahlen.py
+poe cycling        # munich_cycling.py
+poe pipelines      # both in sequence
+
+# Docs
+poe docs           # great-docs build
+poe docs_preview   # great-docs preview (local server)
 ```
 
 ## Requirements

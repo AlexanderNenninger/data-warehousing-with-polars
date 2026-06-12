@@ -1,10 +1,18 @@
 """Tests for SCD Type 2 and Type 4 write semantics."""
 
+from datetime import date
 from pathlib import Path
 
 import polars as pl
+from deltalake import DeltaTable, write_deltalake
 
-from data_warehousing_with_polars.scd import _sink_scd2, _sink_scd4
+from data_warehousing_with_polars.scd import (
+    _partition_predicate,
+    _sink_scd2,
+    _sink_scd4,
+    _sql_literal,
+    _upsert_overwrite,
+)
 
 # ── _sink_scd2 ────────────────────────────────────────────────────────────────
 
@@ -187,3 +195,91 @@ def test_scd4_partition_by(tmp_path):
 
     result = pl.scan_delta(target).collect()
     assert len(result) == 2
+
+
+# ── replaceWhere predicate helpers ────────────────────────────────────────────
+
+
+def test_sql_literal_integer_is_cast_to_column_width():
+    # delta-rs rejects Int32-vs-Int64 comparisons, so integers carry an explicit cast.
+    assert _sql_literal(2024, pl.Int32()) == "CAST(2024 AS INT)"
+    assert _sql_literal(2024, pl.Int64()) == "CAST(2024 AS BIGINT)"
+
+
+def test_sql_literal_string_is_quoted_and_escaped():
+    assert _sql_literal("EU", pl.Utf8()) == "'EU'"
+    assert _sql_literal("O'Hare", pl.Utf8()) == "'O''Hare'"
+
+
+def test_sql_literal_date_and_bool():
+    assert _sql_literal(date(2024, 1, 1), pl.Date()) == "CAST('2024-01-01' AS DATE)"
+    assert _sql_literal(True, pl.Boolean()) == "true"
+
+
+def test_partition_predicate_multi_column():
+    df = pl.DataFrame({"year": pl.Series([2024, 2025], dtype=pl.Int32), "region": ["EU", "US"]})
+    pred = _partition_predicate(df, ["year", "region"])
+    assert pred == "year IN (CAST(2024 AS INT), CAST(2025 AS INT)) AND region IN ('EU', 'US')"
+
+
+def test_partition_predicate_falls_back_on_null_partition_value():
+    df = pl.DataFrame({"region": ["EU", None]})
+    assert _partition_predicate(df, ["region"]) is None
+
+
+# ── _upsert_overwrite ─────────────────────────────────────────────────────────
+
+
+def _files_by_partition(target: str, part_col: str) -> dict[str, set[str]]:
+    import re
+
+    out: dict[str, set[str]] = {}
+    for uri in DeltaTable(target).file_uris():
+        m = re.search(rf"{part_col}=([^/]+)", uri)
+        out.setdefault(m.group(1) if m else "?", set()).add(uri)
+    return out
+
+
+def test_upsert_overwrite_partitioned_rewrites_only_touched_partitions(tmp_path):
+    target = str(tmp_path / "t")
+    df = pl.DataFrame(
+        {
+            "id": list(range(6)),
+            "year": pl.Series([2020, 2020, 2021, 2021, 2022, 2022], dtype=pl.Int32),
+            "v": [1.0] * 6,
+        }
+    )
+    write_deltalake(target, df.to_arrow(), mode="overwrite", partition_by=["year"])
+    before = _files_by_partition(target, "year")
+
+    # Update only year 2021 (and insert a new id there).
+    batch = pl.DataFrame(
+        {"id": [2, 3, 99], "year": pl.Series([2021, 2021, 2021], dtype=pl.Int32), "v": [9.0] * 3}
+    )
+    _upsert_overwrite(target, batch, ["id"], ["year"])
+    after = _files_by_partition(target, "year")
+
+    # Untouched partitions keep their exact files; only 2021 is rewritten.
+    assert after["2020"] == before["2020"]
+    assert after["2022"] == before["2022"]
+    assert after["2021"] != before["2021"]
+
+    out = pl.scan_delta(target).collect().sort("id")
+    assert len(out) == 7  # 6 + 1 new
+    assert out.filter(pl.col("year") == 2021)["v"].unique().to_list() == [9.0]
+    assert out.filter(pl.col("year") == 2020)["v"].unique().to_list() == [1.0]
+    assert out.group_by("id").len().filter(pl.col("len") > 1).is_empty()
+
+
+def test_upsert_overwrite_unpartitioned_full_rewrite(tmp_path):
+    target = str(tmp_path / "t")
+    df = pl.DataFrame({"id": [1, 2, 3], "v": [1.0, 1.0, 1.0]})
+    write_deltalake(target, df.to_arrow(), mode="overwrite")
+
+    batch = pl.DataFrame({"id": [2, 4], "v": [9.0, 9.0]})
+    _upsert_overwrite(target, batch, ["id"], None)
+
+    out = pl.scan_delta(target).collect().sort("id")
+    assert out["id"].to_list() == [1, 2, 3, 4]
+    assert out.filter(pl.col("id") == 2)["v"][0] == 9.0
+    assert out.group_by("id").len().filter(pl.col("len") > 1).is_empty()
