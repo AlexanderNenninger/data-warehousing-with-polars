@@ -47,12 +47,17 @@ from pathlib import Path
 from typing import cast
 
 import polars as pl
-from dotenv import load_dotenv
 
 from data_warehousing_with_polars import incremental, schema
 from data_warehousing_with_polars.incremental import Batch
 
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    print("python-dotenv not found, skipping .env loading")
+
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -258,7 +263,8 @@ def counts_daily(lf: pl.LazyFrame) -> pl.LazyFrame:
         pl.col("datum").str.to_date("%d.%m.%Y", strict=False),
     )
     return (
-        lf.rename({"min-temp": "min_temp", "max-temp": "max_temp"})
+        lf
+        .rename({"min-temp": "min_temp", "max-temp": "max_temp"})
         .with_columns(parsed_datum.alias("datum"))
         .with_columns(pl.col("datum").dt.year().alias("year"))
     )

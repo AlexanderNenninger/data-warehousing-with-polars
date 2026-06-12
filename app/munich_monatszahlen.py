@@ -56,9 +56,16 @@ from pathlib import Path
 from typing import cast
 
 import polars as pl
-from dotenv import load_dotenv
 
 from data_warehousing_with_polars import from_query, incremental
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    print("python-dotenv not found, skipping .env loading")
+
 
 load_dotenv()
 
@@ -123,7 +130,8 @@ def _transform(df: pl.DataFrame, source_path: str) -> pl.DataFrame:
     """
     now = datetime.now(timezone.utc)
     result = (
-        df.lazy()
+        df
+        .lazy()
         .filter(pl.col("MONAT") != "Summe")
         .with_columns(
             pl.col("MONAT").str.strptime(pl.Date, "%Y%m", strict=False).alias("date"),
