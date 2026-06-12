@@ -23,13 +23,9 @@ from pathlib import Path
 
 import altair as alt
 import polars as pl
+from dotenv import load_dotenv
 
-_env = Path("..") / ".env"
-if _env.exists():
-    for _line in _env.read_text().splitlines():
-        if _line and not _line.startswith("#") and "=" in _line:
-            _k, _, _v = _line.partition("=")
-            os.environ.setdefault(_k.strip(), _v.strip())
+load_dotenv()
 
 BUCKET = os.environ.get("MUNICH_CYCLING_BUCKET", "data-warehousing-with-polars")
 ```
