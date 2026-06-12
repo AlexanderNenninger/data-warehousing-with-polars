@@ -7,7 +7,7 @@ SCD Type 2 (valid_from/valid_to history) and Type 4 (separate history table) wri
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import cast
 
 import polars as pl
@@ -17,6 +17,114 @@ from deltalake.exceptions import TableNotFoundError
 logger = logging.getLogger(__name__)
 
 _CDF_CONFIG = {"delta.enableChangeDataFeed": "true"}
+
+
+# Maps polars integer dtypes to SQL type names so partition literals match the
+# column's exact width. delta-rs's kernel refuses mixed-width comparisons (e.g.
+# Int32 column vs an unqualified — Int64 — literal), so integers must be cast.
+_INT_SQL_TYPE = {
+    "Int8": "TINYINT",
+    "Int16": "SMALLINT",
+    "Int32": "INT",
+    "Int64": "BIGINT",
+    "UInt8": "SMALLINT",
+    "UInt16": "INT",
+    "UInt32": "BIGINT",
+    "UInt64": "BIGINT",
+}
+
+
+def _sql_literal(value: object, dtype: pl.DataType) -> str:
+    """Render *value* as a SQL literal for a Delta ``replaceWhere`` predicate.
+
+    Integers and dates are wrapped in a ``CAST`` to the column's exact type so the
+    kernel does not reject a width mismatch when evaluating the predicate.
+    """
+    if dtype == pl.Boolean:
+        return "true" if value else "false"
+    if dtype.is_integer():
+        return f"CAST({value} AS {_INT_SQL_TYPE.get(str(dtype), 'BIGINT')})"
+    if dtype == pl.Date:
+        iso = value.isoformat() if isinstance(value, date) else str(value)
+        return f"CAST('{iso}' AS DATE)"
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _partition_predicate(df: pl.DataFrame, partition_cols: list[str]) -> str | None:
+    """Build a ``replaceWhere`` predicate covering every partition *df* touches.
+
+    Returns ``col IN (...) AND col2 IN (...)`` over the distinct partition values in
+    *df*, or ``None`` if any partition column has a null or a dtype we don't render
+    safely — in which case the caller falls back to a full-table rewrite.
+    """
+    schema = df.schema
+    clauses: list[str] = []
+    for col in partition_cols:
+        dtype = schema[col]
+        if df[col].null_count() > 0:
+            return None
+        if not (dtype.is_integer() or dtype in (pl.Utf8, pl.Boolean, pl.Date)):
+            return None
+        values = df[col].unique().sort().to_list()
+        literals = ", ".join(_sql_literal(v, dtype) for v in values)
+        clauses.append(f"{col} IN ({literals})")
+    return " AND ".join(clauses)
+
+
+def _upsert_overwrite(
+    target: str,
+    df: pl.DataFrame,
+    join_cols: list[str],
+    partition_list: list[str] | None,
+) -> None:
+    """Upsert *df* into *target* by rewriting only the affected data, avoiding ``MERGE``.
+
+    delta-rs 1.6's ``MERGE`` is unusable here: it fails deterministically with
+    "matched a target row with multiple source rows" once a single merge matches
+    more than 8192 rows, even though the join keys are provably unique (see the
+    repro in the project notes). So we never issue a ``MERGE``.
+
+    **Partitioned target** (``partition_list`` set and renderable): read only the
+    partitions the batch touches, drop rows whose *join_cols* are in the batch
+    (anti-join), concatenate the new rows, and ``replaceWhere``-overwrite *just those
+    partitions* in one atomic commit. Cost scales with the data the batch touches,
+    not the table — so arbitrarily large tables are fine as long as a batch lands in
+    a bounded set of partitions.
+
+    **Unpartitioned target** (or a partition dtype we can't render into a predicate):
+    fall back to a full-table anti-join + overwrite. Without partitioning there is no
+    way to localise the write; partition the target to scale.
+    """
+    predicate = _partition_predicate(df, partition_list) if partition_list else None
+
+    if predicate is not None:
+        assert partition_list is not None
+        existing = pl.scan_delta(target)
+        for col in partition_list:
+            existing = existing.filter(pl.col(col).is_in(df[col].unique().to_list()))
+        keep = existing.join(df.lazy().select(join_cols), on=join_cols, how="anti")
+        merged = cast(pl.DataFrame, pl.concat([keep, df.lazy()], how="diagonal_relaxed").collect())
+        write_deltalake(
+            target,
+            merged.to_arrow(),
+            mode="overwrite",
+            predicate=predicate,
+            partition_by=partition_list,
+            writer_properties=WriterProperties(),
+        )
+        return
+
+    keep = pl.scan_delta(target).join(df.lazy().select(join_cols), on=join_cols, how="anti")
+    merged = cast(pl.DataFrame, pl.concat([keep, df.lazy()], how="diagonal_relaxed").collect())
+    write_deltalake(
+        target,
+        merged.to_arrow(),
+        mode="overwrite",
+        schema_mode="overwrite",
+        configuration=_CDF_CONFIG,
+        partition_by=partition_list,
+        writer_properties=WriterProperties(),
+    )
 
 
 def _sink_scd2(
@@ -47,7 +155,7 @@ def _sink_scd2(
     df = cast(pl.DataFrame, _raw)
 
     try:
-        dt = DeltaTable(target)
+        DeltaTable(target)  # existence probe; raises TableNotFoundError on first run
     except TableNotFoundError:
         write_deltalake(
             target,
@@ -60,22 +168,33 @@ def _sink_scd2(
         return
 
     # Step 1: Close existing current versions for keys in the incoming batch.
-    # NOTE: We intentionally keep `is_current = true` as a *per-action* predicate
-    # rather than in the outer merge predicate. The outer predicate triggers the
-    # Delta kernel's file-skipping stats lookup, and boolean columns are absent from
-    # minValues/maxValues in the stats JSON, causing a kernel error in deltalake 1.6.
-    key_pred = " AND ".join(f"target.{k} = source.{k}" for k in keys)
-    now_sql = now.strftime("%Y-%m-%dT%H:%M:%S.%f")
-    (
-        dt.merge(df.to_arrow(), predicate=key_pred, source_alias="source", target_alias="target")
-        .when_matched_update(
-            predicate="target.is_current = true",
-            updates={
-                "valid_to": f"CAST('{now_sql}' AS TIMESTAMP)",
-                "is_current": "false",
-            },
+    # Done as a full-table rewrite rather than a Delta MERGE: delta-rs 1.6's MERGE is
+    # unreliable on object-store (S3) targets at scale (see _upsert_overwrite). Only
+    # rows that are currently open AND whose key appears in the batch are closed.
+    incoming = df.select(keys).unique().with_columns(pl.lit(True).alias("__match"))
+    to_close = pl.col("__match").fill_null(False) & pl.col("is_current")
+    closed = cast(
+        pl.DataFrame,
+        pl.scan_delta(target)
+        .join(incoming.lazy(), on=keys, how="left")
+        .with_columns(
+            pl.when(to_close).then(pl.lit(now)).otherwise(pl.col("valid_to")).alias("valid_to"),
+            pl.when(to_close)
+            .then(pl.lit(False))
+            .otherwise(pl.col("is_current"))
+            .alias("is_current"),
         )
-        .execute()
+        .drop("__match")
+        .collect(),
+    )
+    write_deltalake(
+        target,
+        closed.to_arrow(),
+        mode="overwrite",
+        schema_mode="overwrite",
+        configuration=_CDF_CONFIG,
+        partition_by=partition_list,
+        writer_properties=WriterProperties(),
     )
 
     # Step 2: Append new current versions, deduplicating on (key, valid_from)
@@ -114,7 +233,7 @@ def _sink_scd4(
     df = cast(pl.DataFrame, _raw).unique(subset=keys, keep="last")
 
     try:
-        dt = DeltaTable(target)
+        DeltaTable(target)  # existence probe; raises TableNotFoundError on first run
 
         # Step 1: Archive current versions of affected records.
         incoming_keys = df.select(keys).unique()
@@ -143,15 +262,7 @@ def _sink_scd4(
                 )
 
         # Step 2: Upsert current state (SCD Type 1 semantics).
-        key_pred = " AND ".join(f"target.{k} = source.{k}" for k in keys)
-        (
-            dt.merge(
-                df.to_arrow(), predicate=key_pred, source_alias="source", target_alias="target"
-            )
-            .when_matched_update_all()
-            .when_not_matched_insert_all()
-            .execute()
-        )
+        _upsert_overwrite(target, df, keys, partition_list)
 
     except TableNotFoundError:
         write_deltalake(

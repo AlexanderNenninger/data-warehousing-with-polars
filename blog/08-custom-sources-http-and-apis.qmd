@@ -1,0 +1,268 @@
+---
+title: Custom Sources — Ingesting from HTTP, APIs, and Beyond
+---
+
+Every pipeline so far has read from somewhere the library can *list*: a directory of
+Parquet files, or another Delta table queried through its Change Data Feed.
+The watermark tracks a file path or a table version, and "what's new?" is answered by
+diffing that list against what has already been seen.
+
+A lot of data does not arrive that way.
+It sits behind an HTTP endpoint that serves a fresh CSV every morning, or an API whose
+download URLs change on every publish, or a service that hands you the whole history and
+leaves you to work out what changed.
+For these, "which file have I seen?" is the wrong question.
+The right one is "what cursor did I leave off at?" — and that cursor might be a timestamp,
+a month stamp, an ETag, or a set of URLs.
+
+The `Source` protocol exists so you can answer that question however your transport demands,
+without giving up the watermarking, idempotency, and lazy-transform contract from the
+previous posts.
+
+## The protocol
+
+A source is any object with a single method:
+
+```python
+@runtime_checkable
+class Source(Protocol):
+    def poll(self, since: object | None) -> Batch | None:
+        ...
+```
+
+`poll` receives the cursor saved by the previous run — `None` on the first run — and returns
+either a `Batch` (new data plus the next cursor) or `None` when nothing has changed:
+
+```python
+@dataclass(frozen=True)
+class Batch:
+    frame: pl.LazyFrame
+    cursor: object        # JSON-serialisable; handed back as `since` next run
+```
+
+That is the whole contract.
+Everything downstream is unchanged: the pipeline runs your transform on `batch.frame`, writes
+the target, and only then persists `batch.cursor`.
+
+The cursor is stored in the *same* watermark table the file-based sources use, serialised as
+JSON. The write-before-watermark ordering from the [watermarks post](02-watermarks-idempotent-ingestion.qmd)
+applies identically — if the process dies after the target write but before the cursor is
+saved, the next run re-polls from the old cursor and re-writes the same batch.
+An upsert target (`merge_on`) absorbs the repeat, so you still get at-least-once delivery with
+idempotent results.
+
+Because the cursor stores JSON rather than a file path or a version integer, the watermark
+schema differs from the built-in sources.
+A pre-existing watermark written by a file-based pipeline is simply ignored on the first custom
+run, which starts from `since=None` as if fresh.
+
+Most of the time you will not write `poll` by hand. Two helpers cover the common shapes.
+
+## `from_query` — a column high-water-mark
+
+The most common HTTP pattern is a source that hands you a snapshot and expects you to figure
+out what is new.
+`from_query` reduces that to one decision: name a column, and its maximum value becomes the
+cursor for the next run.
+
+```python
+from data_warehousing_with_polars import incremental, from_query
+
+
+def fetch_orders(since: str | None) -> pl.LazyFrame | None:
+    resp = httpx.get("https://api.example.com/orders.csv")
+    df = pl.read_csv(resp.content)
+    if since is not None:
+        df = df.filter(pl.col("updated_at") > since)
+    if df.is_empty():
+        return None
+    return df.lazy()
+
+
+@incremental(
+    source=from_query(fetch_orders, cursor_on="updated_at"),
+    target="/data/delta/orders",
+    merge_on="order_id",
+)
+def orders(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf
+```
+
+On the first run `since` is `None`, so `fetch_orders` returns the whole table and the cursor
+becomes the largest `updated_at` it saw.
+On the next run that value comes back as `since`, the function filters to newer rows, and the
+cursor advances again.
+When the filter leaves nothing, the function returns `None` and the run is a no-op — no target
+write, no cursor change.
+
+There is one deliberate trade-off.
+To compute the cursor max, `from_query` collects the returned frame once:
+
+```python
+def poll(self, since: object | None) -> Batch | None:
+    lf = self._fn(since)
+    if lf is None:
+        return None
+    df = cast(pl.DataFrame, lf.collect())
+    cursor = df[self._cursor_on].max()
+    if cursor is None:
+        return None
+    return Batch(frame=df.lazy(), cursor=cursor)
+```
+
+That `collect()` is fine for HTTP and API payloads that fit in memory, which is the case it is
+built for. If your source is large enough that collecting it is a problem, you have outgrown
+`from_query` — implement `Source` directly and compute the cursor without materialising
+everything.
+
+### The snapshot-replacement variant
+
+Some endpoints give you no `updated_at` to filter on.
+They republish the *entire* history every period, identical rows and all — the Munich
+Monatszahlen datasets work exactly like this.
+Here the natural cursor is not a column in the data but the period itself.
+Stamp the batch with the current period and use that stamp as the cursor:
+
+```python
+def fetch_month(since: str | None) -> pl.LazyFrame | None:
+    stamp = datetime.now().strftime("%Y%m")
+    if since == stamp:
+        return None                       # already ingested this month
+    df = pl.read_csv(download_current_csv())
+    return df.with_columns(pl.lit(stamp).alias("_stamp")).lazy()
+
+
+@incremental(
+    source=from_query(fetch_month, cursor_on="_stamp"),
+    target="/data/delta/monatszahlen",
+    merge_on=["category", "month"],
+)
+def monatszahlen(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf.drop("_stamp")             # cursor column is not part of the data
+```
+
+The `since == stamp` check short-circuits the download entirely once the month is done, so a
+pipeline scheduled hourly does the actual fetch at most once per month.
+`merge_on` collapses the duplicate history within each delivery, and the transform drops
+`_stamp` before it reaches the target — that column exists only to drive the cursor.
+
+## `from_frame` — full refresh every run
+
+For a small reference table you simply want to re-read in full each time — a lookup of country
+codes, a feature-flag table, a slowly-changing dimension small enough not to bother with deltas
+— `from_frame` skips the cursor logic entirely:
+
+```python
+from data_warehousing_with_polars import incremental, from_frame
+
+
+@incremental(
+    source=from_frame(lambda: pl.scan_csv("https://example.com/reference.csv")),
+    target="/data/delta/reference",
+    merge_on="code",
+)
+def reference(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf
+```
+
+The cursor is always `None`, so every run ingests everything.
+That makes `merge_on` mandatory in practice: without it, each run would append a second copy of
+the whole table.
+With it, the merge updates rows in place and the target converges to the latest snapshot no
+matter how many times you run it.
+
+## Implementing `Source` directly
+
+When the cursor is neither a column max nor "always refresh", write the protocol yourself.
+The motivating case is a paginated or multi-file API where "what's new" is a *set of URLs* you
+have not downloaded yet — there is no high-water-mark column, because the unit of progress is
+the URL, not a row value.
+
+```python
+from data_warehousing_with_polars import incremental
+from data_warehousing_with_polars.incremental import Batch
+
+
+class ApiFileSource:
+    """Cursor is the sorted list of already-downloaded URLs."""
+
+    def poll(self, since: object | None) -> Batch | None:
+        seen: set[str] = set(since) if isinstance(since, list) else set()
+        available = list_download_urls()              # ask the API what exists
+        new = [u for u in available if u not in seen]
+        if not new:
+            return None
+        frame = pl.concat([pl.scan_csv(download(u)) for u in new])
+        return Batch(frame=frame, cursor=sorted(seen | set(new)))
+
+
+@incremental(
+    source=ApiFileSource(),
+    target="/data/delta/api_files",
+    merge_on="id",
+)
+def api_files(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf
+```
+
+The cursor here is a JSON list that grows by one entry per file ingested.
+Because it is stored in the watermark and handed back as `since`, the source only ever
+downloads URLs it has not seen — across process restarts and machine migrations, since none of
+that state lives locally.
+
+One caution, because it is the thing that can bite you: the cursor is serialised to JSON and
+written to the watermark on every run, so an unbounded set of URLs means an ever-growing cursor.
+For a source that tops out at a few hundred files this is a non-issue.
+If yours is genuinely unbounded, encode progress more compactly — a single "max date seen" or
+"last page token" — rather than accumulating every identifier.
+
+## Fanning in: every source is just a `Source`
+
+The protocol pays a second dividend beyond HTTP and APIs.
+Once *every* source — a directory of files, a Delta table read through CDF, a custom poller —
+is reduced to the same `poll(since) -> Batch | None` shape, fan-in stops being a special case.
+Internally a directory becomes a source whose cursor is the set of processed paths, and a Delta
+table becomes one whose cursor is the last version; a user `Source` already is one.
+
+So you can pass a **list** to `source` and the pipeline polls each slot with its own cursor,
+omits the ones with nothing new, and hands the rest to the transform as positional arguments:
+
+```python
+@incremental(
+    source=[
+        "/data/uploads/",                              # directory source
+        from_query(fetch_orders, cursor_on="updated_at"),  # HTTP source
+    ],
+    target="/data/delta/combined",
+    merge_on="id",
+)
+def combine(*lfs: pl.LazyFrame) -> pl.LazyFrame:
+    return pl.concat(list(lfs))
+```
+
+Each slot keeps an independent cursor in the watermark, so a run where only the HTTP source has
+moved processes just that frame and leaves the directory's cursor untouched.
+Use `*lfs` rather than fixed parameters, since idle sources drop out of the argument list — the
+same variable-arity rule the file-only fan-in already followed.
+
+The one combination a single list cannot express is directories *and* Delta tables together,
+because `file_format` is a pipeline-wide setting. If you need that mix, wrap one of them in a
+custom `Source`.
+
+## Choosing among the three
+
+The decision is short:
+
+- The source exposes a column that monotonically marks freshness (`updated_at`, a sequence
+  number, a period stamp)? **`from_query`** with that column as `cursor_on`.
+- The source is a small full table you want to re-merge every run? **`from_frame`** with
+  `merge_on`.
+- Progress is tracked by something that is not a column — a set of URLs, an ETag, a page token?
+  **Implement `Source`** and put that something in the cursor.
+
+In all three, the rest of the pipeline is unchanged.
+The transform still receives a `LazyFrame` and knows nothing about where the data came from.
+The watermark still records progress only after a successful write.
+Idempotency still falls out of at-least-once polling combined with an upsert target.
+The protocol changes only *how the pipeline learns what is new* — never the guarantees it makes
+once it knows.
