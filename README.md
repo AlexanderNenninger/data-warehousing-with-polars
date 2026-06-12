@@ -154,6 +154,78 @@ def propagate(lf: pl.LazyFrame) -> pl.LazyFrame:
     return lf
 ```
 
+### Custom sources — HTTP, APIs, and other transports
+
+File paths and Delta tables cover the common case, but some sources publish data over HTTP or behind an API. The `Source` protocol lets any object drive a pipeline as long as it implements `poll(since) -> Batch | None`.
+
+**`from_query`** — for sources that return a full snapshot on every call (e.g. a CSV downloaded from a URL). The cursor is the maximum value of a column you designate; `poll` returns `None` when the cursor hasn't advanced.
+
+```python
+import urllib.request
+import polars as pl
+from data_warehousing_with_polars import incremental, from_query
+
+
+def _fetch(since: object | None) -> pl.LazyFrame | None:
+    stamp = "202506"          # e.g. derived from current month
+    if since == stamp:
+        return None           # already up to date
+    with urllib.request.urlopen("https://example.com/data.csv") as r:
+        raw = pl.read_csv(r.read())
+    return raw.with_columns(pl.lit(stamp).alias("_stamp")).lazy()
+
+
+@incremental(
+    source=from_query(_fetch, cursor_on="_stamp"),
+    target="s3://my-bucket/delta/dataset",
+    merge_on="id",
+)
+def dataset(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf.drop("_stamp")
+
+
+dataset.run()
+```
+
+The cursor is JSON-serialised and stored in the watermark table. On the next run, `since` receives the value that was returned as `cursor`, so the fetch function can skip unchanged data.
+
+**`from_frame`** — for sources where the transform always re-reads the full frame (e.g. a slowly-changing reference file). The cursor never advances; `merge_on` prevents duplicates.
+
+```python
+from data_warehousing_with_polars import incremental, from_frame
+
+@incremental(
+    source=from_frame(lambda: pl.scan_csv("https://example.com/reference.csv")),
+    target="s3://my-bucket/delta/reference",
+    merge_on="id",
+)
+def reference(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf
+```
+
+**Direct `Source` implementation** — implement the protocol directly when the cursor needs custom logic, such as tracking a set of already-processed URLs:
+
+```python
+from data_warehousing_with_polars import incremental
+from data_warehousing_with_polars.incremental import Batch
+import polars as pl
+
+
+class MyApiSource:
+    def poll(self, since: object | None) -> Batch | None:
+        seen: set[str] = set(since) if isinstance(since, list) else set()
+        new_urls = [u for u in _list_api_urls() if u not in seen]
+        if not new_urls:
+            return None
+        lf = pl.concat([pl.scan_csv(u) for u in new_urls])
+        return Batch(frame=lf, cursor=sorted(seen | set(new_urls)))
+
+
+@incremental(source=MyApiSource(), target="s3://my-bucket/delta/data", merge_on="id")
+def data(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf
+```
+
 ### Schema validation
 
 The `@schema` decorator validates a LazyFrame's schema before it reaches the transform. It operates on schema metadata only (via `lf.collect_schema()`), keeping the pipeline lazy on the happy path.
@@ -251,6 +323,15 @@ poe lint         # ruff check --fix
 poe typecheck    # ty check
 poe test         # pytest (excludes memory tests)
 poe test_memory  # memory-boundedness tests (each in a fresh subprocess)
+
+# Demo pipelines (require AWS credentials in .env)
+poe monatszahlen   # munich_monatszahlen.py
+poe cycling        # munich_cycling.py
+poe pipelines      # both in sequence
+
+# Docs
+poe docs           # great-docs build
+poe docs_preview   # great-docs preview (local server)
 ```
 
 ## Requirements
