@@ -162,11 +162,13 @@ class ListExtNamespace:
             A ``List[Struct{first: T, second: U}]`` expression.
 
         Example:
-            >>> import polars as pl
-            >>> import polars_list_ext  # noqa: F401 — registers the namespace
-            >>> df = pl.DataFrame({"a": [[1, 2, 3]], "b": [[4, 5, 6]]})
-            >>> df.with_columns(pl.col("a").list_ext.zip(pl.col("b")).alias("zipped"))
-            shape: (1, 3)
+            ```python
+            import polars as pl
+            import polars_list_ext  # noqa: F401 — registers the namespace
+            df = pl.DataFrame({"a": [[1, 2, 3]], "b": [[4, 5, 6]]})
+            df.with_columns(pl.col("a").list_ext.zip(pl.col("b")).alias("zipped"))
+            # shape: (1, 3)
+            ```
         """
         other_expr = pl.col(other) if isinstance(other, str) else other
         return register_plugin_function(
@@ -188,13 +190,15 @@ class ListExtNamespace:
             names and types mirror those of the inner struct.
 
         Example:
-            >>> import polars as pl
-            >>> import polars_list_ext  # noqa: F401 — registers the namespace
-            >>> df = pl.DataFrame({"pairs": [
-            ...     [{"first": 1, "second": 4}, {"first": 2, "second": 5}]
-            ... ]})
-            >>> df.with_columns(pl.col("pairs").list_ext.unzip().alias("unzipped"))
-            shape: (1, 2)
+            ```python
+            import polars as pl
+            import polars_list_ext  # noqa: F401 — registers the namespace
+            df = pl.DataFrame({"pairs": [
+                [{"first": 1, "second": 4}, {"first": 2, "second": 5}]
+            ]})
+            df.with_columns(pl.col("pairs").list_ext.unzip().alias("unzipped"))
+            # shape: (1, 2)
+            ```
         """
         return register_plugin_function(
             args=[self._expr],
@@ -228,13 +232,15 @@ class ListExtNamespace:
             - ``anti``: ``List[Struct{left fields}]``
 
         Example:
-            >>> import polars as pl
-            >>> import polars_list_ext  # noqa: F401 — registers the namespace
-            >>> orders = pl.DataFrame({"o": [[{"id": 1, "qty": 10}, {"id": 2, "qty": 5}]]})
-            >>> products = pl.DataFrame({"p": [[{"id": 1, "name": "A"}, {"id": 3, "name": "C"}]]})
-            >>> orders.with_columns(
-            ...     pl.col("o").list_ext.join(pl.col("p"), on="id").alias("joined")
-            ... )
+            ```python
+            import polars as pl
+            import polars_list_ext  # noqa: F401 — registers the namespace
+            orders = pl.DataFrame({"o": [[{"id": 1, "qty": 10}, {"id": 2, "qty": 5}]]})
+            products = pl.DataFrame({"p": [[{"id": 1, "name": "A"}, {"id": 3, "name": "C"}]]})
+            orders.with_columns(
+                pl.col("o").list_ext.join(pl.col("p"), on="id").alias("joined")
+            )
+            ```
         """
         other_expr = pl.col(other) if isinstance(other, str) else other
         return register_plugin_function(
@@ -252,7 +258,9 @@ class ListExtNamespace:
             ``List[Struct{index: UInt32, value: T}]``
 
         Example:
-            >>> pl.col("xs").list_ext.enumerate()
+            ```python
+            pl.col("xs").list_ext.enumerate()
+            ```
         """
         return register_plugin_function(
             args=[self._expr],
@@ -272,7 +280,9 @@ class ListExtNamespace:
             ``List[T]`` with consecutive duplicates removed.
 
         Example:
-            >>> pl.col("xs").list_ext.dedup()
+            ```python
+            pl.col("xs").list_ext.dedup()
+            ```
         """
         return register_plugin_function(
             args=[self._expr],
@@ -294,7 +304,9 @@ class ListExtNamespace:
             ``List[T]``
 
         Example:
-            >>> pl.col("xs").list_ext.rotate(2)
+            ```python
+            pl.col("xs").list_ext.rotate(2)
+            ```
         """
         return register_plugin_function(
             args=[self._expr],
@@ -318,7 +330,9 @@ class ListExtNamespace:
             ``List[List[T]]``
 
         Example:
-            >>> pl.col("signal").list_ext.windows(4, step=2)
+            ```python
+            pl.col("signal").list_ext.windows(4, step=2)
+            ```
         """
         return register_plugin_function(
             args=[self._expr],
@@ -341,7 +355,9 @@ class ListExtNamespace:
             ``List[List[T]]``
 
         Example:
-            >>> pl.col("signal").list_ext.chunks(8)
+            ```python
+            pl.col("signal").list_ext.chunks(8)
+            ```
         """
         return register_plugin_function(
             args=[self._expr],
@@ -366,7 +382,9 @@ class ListExtNamespace:
             ``UInt32`` — index of first match, or ``null``.
 
         Example:
-            >>> pl.col("signal").list_ext.position("gt", 0.5)
+            ```python
+            pl.col("signal").list_ext.position("gt", 0.5)
+            ```
         """
         return register_plugin_function(
             args=[self._expr],
@@ -391,7 +409,9 @@ class ListExtNamespace:
             ``List[Float64]``
 
         Example:
-            >>> pl.col("signal").list_ext.flat_map("mul", 2.0)
+            ```python
+            pl.col("signal").list_ext.flat_map("mul", 2.0)
+            ```
         """
         return register_plugin_function(
             args=[self._expr],
