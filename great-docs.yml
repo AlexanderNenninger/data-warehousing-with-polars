@@ -95,6 +95,13 @@ reference:
       - list_ext.agg_of_range
       - list_ext.mean_of_range
 
+  - title: "List Extensions: Combinators"
+    desc: Functional combinators for Polars List columns, available via the `list_ext` expression namespace
+    contents:
+      - list_ext.ListExtNamespace.zip
+      - list_ext.ListExtNamespace.unzip
+      - list_ext.ListExtNamespace.join
+
 sections:
   - title: Blog
     dir: blog

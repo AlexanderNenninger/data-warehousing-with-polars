@@ -26,6 +26,7 @@ members = ["packages/*"]
 dev = [
     "altair>=6.1.0",
     "great-docs>=0.11.0",
+    "hypothesis>=6.0.0",
     "matplotlib>=3.4.0",
     "maturin>=1.0,<2.0",
     "numpy>=2.2.3",
