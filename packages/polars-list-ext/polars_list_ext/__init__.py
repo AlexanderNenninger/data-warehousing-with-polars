@@ -244,3 +244,159 @@ class ListExtNamespace:
             function_name="expr_list_join",
             is_elementwise=True,
         )
+
+    def enumerate(self) -> pl.Expr:
+        """Zip each element with its 0-based position index.
+
+        Returns:
+            ``List[Struct{index: UInt32, value: T}]``
+
+        Example:
+            >>> pl.col("xs").list_ext.enumerate()
+        """
+        return register_plugin_function(
+            args=[self._expr],
+            plugin_path=root_path,
+            function_name="expr_list_enumerate",
+            is_elementwise=True,
+        )
+
+    def dedup(self) -> pl.Expr:
+        """Remove consecutive duplicate elements (like Unix ``uniq``).
+
+        Only adjacent duplicates are removed — use ``list.unique()`` for
+        set-based deduplication. Null elements are treated as equal to each
+        other.
+
+        Returns:
+            ``List[T]`` with consecutive duplicates removed.
+
+        Example:
+            >>> pl.col("xs").list_ext.dedup()
+        """
+        return register_plugin_function(
+            args=[self._expr],
+            plugin_path=root_path,
+            function_name="expr_list_dedup",
+            is_elementwise=True,
+        )
+
+    def rotate(self, n: int) -> pl.Expr:
+        """Rotate list elements by ``n`` positions.
+
+        Positive ``n`` rotates right (towards higher indices); negative
+        rotates left. Wraps modulo the list length.
+
+        Args:
+            n: Number of positions to rotate.
+
+        Returns:
+            ``List[T]``
+
+        Example:
+            >>> pl.col("xs").list_ext.rotate(2)
+        """
+        return register_plugin_function(
+            args=[self._expr],
+            kwargs={"n": n},
+            plugin_path=root_path,
+            function_name="expr_list_rotate",
+            is_elementwise=True,
+        )
+
+    def windows(self, size: int, step: int = 1) -> pl.Expr:
+        """Produce a sliding window view as ``List[List[T]]``.
+
+        Each inner list has exactly ``size`` elements. Lists shorter than
+        ``size`` produce an empty outer list.
+
+        Args:
+            size: Window size (must be > 0).
+            step: Step between window starts (default 1, must be > 0).
+
+        Returns:
+            ``List[List[T]]``
+
+        Example:
+            >>> pl.col("signal").list_ext.windows(4, step=2)
+        """
+        return register_plugin_function(
+            args=[self._expr],
+            kwargs={"size": size, "step": step},
+            plugin_path=root_path,
+            function_name="expr_list_windows",
+            is_elementwise=True,
+        )
+
+    def chunks(self, size: int) -> pl.Expr:
+        """Partition each list into non-overlapping chunks of ``size``.
+
+        The last chunk may be smaller than ``size`` if the list length is not
+        a multiple of ``size``.
+
+        Args:
+            size: Chunk size (must be > 0).
+
+        Returns:
+            ``List[List[T]]``
+
+        Example:
+            >>> pl.col("signal").list_ext.chunks(8)
+        """
+        return register_plugin_function(
+            args=[self._expr],
+            kwargs={"size": size},
+            plugin_path=root_path,
+            function_name="expr_list_chunks",
+            is_elementwise=True,
+        )
+
+    def position(self, op: str, value: float) -> pl.Expr:
+        """Return the index of the first element satisfying a condition.
+
+        The list is cast to ``Float64`` for comparison. Returns ``null`` if
+        no element matches.
+
+        Args:
+            op: Comparison operator — ``"eq"`` | ``"ne"`` | ``"gt"`` |
+                ``"ge"`` | ``"lt"`` | ``"le"``.
+            value: Comparison value.
+
+        Returns:
+            ``UInt32`` — index of first match, or ``null``.
+
+        Example:
+            >>> pl.col("signal").list_ext.position("gt", 0.5)
+        """
+        return register_plugin_function(
+            args=[self._expr],
+            kwargs={"op": op, "value": float(value)},
+            plugin_path=root_path,
+            function_name="expr_list_position",
+            is_elementwise=True,
+        )
+
+    def flat_map(self, op: str, value: float) -> pl.Expr:
+        """Apply a scalar arithmetic operation then return the result as a flat list.
+
+        Equivalent to ``list.eval(pl.element() <op> value)`` but in a single
+        Rust pass. The list is cast to ``Float64``.
+
+        Args:
+            op: Arithmetic operation — ``"add"`` | ``"sub"`` | ``"mul"`` |
+                ``"div"``.
+            value: Scalar operand.
+
+        Returns:
+            ``List[Float64]``
+
+        Example:
+            >>> pl.col("signal").list_ext.flat_map("mul", 2.0)
+        """
+        return register_plugin_function(
+            args=[self._expr],
+            kwargs={"op": op, "value": float(value)},
+            plugin_path=root_path,
+            function_name="expr_list_flat_map",
+            is_elementwise=True,
+        )

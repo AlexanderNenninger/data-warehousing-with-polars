@@ -1,114 +1,131 @@
-# polars-list-ext (`polist`)
+# polars-list-ext
 
-`polars-list-ext` provides a set of utilities for working with List-type columns in Polars DataFrames, especially for signal processing and feature extraction.
+A Polars plugin providing utilities for working with `List`-type columns,
+with a focus on signal processing, feature extraction, and general-purpose
+functional combinators.
 
 > **Attribution.** This package is derived from
 > [`polars_list_utils`](https://github.com/dashdeckers/polars_list_utils) by
 > Travis Hammond (dashdeckers), used under the terms of its original license and
 > modified for use in this repository. The import name is `polars_list_ext`.
 
-So far these utilities comprise those that I found to be missing or lacking from
-the List namespace within the Polars library while I was working on a project at
-work that required extensive handling of signal data which I was storing in Polars
-DataFrames.
+By implementing these operations as a Polars plugin, they participate in query
+optimisation and parallelisation rather than falling back to Python-level loops
+or leaving the DataFrame.
 
-By providing these utilities as a Polars plugin, and thus not having to leave
-the Polars DataFrame for these operations, I was able to significantly speed up
-the processing of my data by benefiting from Polars query optimization and
-parallelization. So while the operations themselves are not necessarily faster
-than their Numpy counterparts (although they might be in some cases), the
-integration with Polars gave my larger processing pipeline a significant speed
-boost.
-
-Status: Work-in-Progress!
-
-## Features
-
-- `polist.apply_fft`
-    - Applies a Fast Fourier Transform (FFT) to a List-type column of signal data.
-    - Can pre-process the signals with a windowing function (e.g. Hann, Hamming, Blackman).
-    - Can pre-process the signals with a Butterworth filter (low-pass, high-pass, band-pass).
-    - Can normalize the FFT amplitudes by the signal length or the window sum.
-
-- `polist.operate_scalar_on_list`
-    - Applies a scalar operation of a Float-type column to each element of a List-type column.
-    - This is currently not supported in Polars, see [this issue][list_eval_named].
-    - Can apply the operations `add`, `sub`, `mul`, and `div`.
-
-- `polist.interpolate_columns`
-    - Interpolates a new List-type column from 3 specified List-type columns.
-    - Behaviour as expected from the `numpy.interp` function, but for Polars DataFrames.
-    - Supply the `x_data`, `y_data`, and `x_interp` columns to obtain the `y_interp` column.
-
-- `polist.aggregate_list_col_elementwise`
-    - Applies element-wise list-aggregations to a List-type column in a GroupBy context.
-    - Currently supports `sum`, `mean`, and `count`.
-    - This is possible using the Polars API e.g. using `list.get(n)` (see my SO question [here][elementwise_agg]), but it does not scale well as for large lists and complicated queries it can lead to a stack overflow (see [this issue][stack_overflow] and many others).
-
-- `polist.mean_of_range`
-    - Computes the mean of a range of y-values defined by some x-values for List-type columns.
-    - This is useful for feature extraction from signals, e.g. to compute the mean of a signal in a certain time range or a spectrum in a certain frequency range.
-    - This is somewhat possible using the Polars API (e.g. using `list.slice` and `list.mean`), but can get very complicated for the simple case of wanting to specify certain y-values based on a custom x-axis.
-
-- `polist.fft_freqs`
-    - Computes the frequencies of the FFT bins for a given sampling rate and number of samples.
-    - This function does not operate dynamically on List-type columns, use it with `pl.lit`.
-    - This is useful for plotting the FFT spectrum in the frequency domain. Similar to the `numpy.fft.fftfreq` function, but in my opinion much simpler.
-
-- `polist.fft_freqs_linspace`
-    - Basically a thin wrapper around something like `numpy.linspace` to create a linearly spaced List of values.
-    - This function does not operate dynamically on List-type columns, use it with `pl.lit`.
-    - This is useful when used together with `polist.interpolate_columns`.
-
-[list_eval_named]: https://github.com/pola-rs/polars/issues/7210
-[elementwise_agg]: https://stackoverflow.com/questions/73776179/element-wise-aggregation-of-a-column-of-type-listf64-in-polars
-[stack_overflow]: https://github.com/pola-rs/polars/issues/5455
-
-
-### Example: (signal) -- (hann window) -- (FFT) -- (Freq. Normalization)
-
-![DSP Example](examples/showcase_dsp.png)
-
-
-## Installation (user)
+## Installation
 
 ```bash
-uv pip install polars-list-ext
+pip install polars-list-ext
 ```
 
-## Installation (developer)
+## Usage
 
-1) Setup Rust (i.e. install rustup)
-2) Setup Python (i.e. install uv)
-3) Setup environment and compile plugin:
+Free functions are called directly; combinators are accessed through the
+`list_ext` expression namespace registered on import:
+
+```python
+import polars as pl
+import polars_list_ext as ple
+
+# Free function
+df.with_columns(ple.apply_fft("signal", sample_rate=1000).alias("spectrum"))
+
+# Namespace combinator
+df.with_columns(pl.col("a").list_ext.zip(pl.col("b")).alias("pairs"))
+df.with_columns(pl.col("pairs").list_ext.unzip().alias("u")).unnest("u")
+```
+
+---
+
+## API Reference
+
+### Signal Processing
+
+| Function | Description |
+|---|---|
+| `apply_fft(col, sample_rate, ...)` | FFT with optional windowing, Butterworth filter, and normalisation |
+| `fft_freqs(n, sample_rate)` | Frequency axis for FFT bins (use with `pl.lit`) |
+| `fft_freqs_linspace(start, stop, n)` | Linearly spaced frequency vector (use with `pl.lit`) |
+
+### Feature Extraction
+
+| Function | Description |
+|---|---|
+| `agg_of_range(y, x, agg, x_min, x_max, ...)` | Aggregate y-values within an x-range |
+| `mean_of_range(y, x, x_min, x_max, ...)` | Mean of y-values within an x-range |
+| `aggregate_list_col_elementwise(col, list_size, agg)` | Column-wise elementwise aggregation in a GroupBy |
+
+### Arithmetic
+
+| Function | Description |
+|---|---|
+| `operate_scalar_on_list(list_col, scalar_col, op)` | Apply `add`/`sub`/`mul`/`div` of a scalar column to each list element |
+| `interpolate_columns(x_data, y_data, x_interp)` | Interpolate a new y-series at arbitrary x positions |
+
+---
+
+### Combinators — `pl.col(...).list_ext.*`
+
+All combinators are accessed via the `list_ext` expression namespace. Importing
+`polars_list_ext` registers it automatically.
+
+#### Structural
+
+| Method | Description |
+|---|---|
+| `.enumerate()` | Pair each element with its index → `List[Struct{index: UInt32, value: T}]` |
+| `.dedup()` | Remove consecutive duplicate elements (like Unix `uniq`) |
+| `.rotate(n)` | Circular shift by `n` positions (positive = right, negative = left) |
+| `.flat_map(op, value)` | Apply a scalar arithmetic op then return a flat `List[Float64]` |
+
+#### Windowing / Chunking
+
+| Method | Description |
+|---|---|
+| `.windows(size, step=1)` | Sliding window view → `List[List[T]]` |
+| `.chunks(size)` | Non-overlapping partitions → `List[List[T]]`; last chunk may be smaller |
+
+#### Searching
+
+| Method | Description |
+|---|---|
+| `.position(op, value)` | Index of first element matching `op` (`"eq"/"ne"/"gt"/"ge"/"lt"/"le"`) → `UInt32` or `null` |
+
+#### Zipping / Pairing
+
+| Method | Description |
+|---|---|
+| `.zip(other)` | Pair elements from two lists → `List[Struct{first: T, second: U}]` |
+| `.unzip()` | Split a `List[Struct]` into a `Struct` of lists — mirrors `struct.unnest` |
+
+#### Joining
+
+| Method | Description |
+|---|---|
+| `.join(other, on, how, suffix="_right")` | Key-based join on `List[Struct]` rows; `how`: `"inner"/"left"/"anti"` |
+
+---
+
+## Development
+
+### Prerequisites
+
+- Rust (via `rustup`)
+- Python ≥ 3.12 (via `uv`)
+
+### Setup
 
 ```bash
-uv sync --extra dev
-uv run maturin develop --release
+# from the monorepo root
+uv sync
+uv run poe ext_build   # compile the Rust plugin
 ```
 
-4) (Maybe) configure Cargo to find uv's Python installs. For example:
-
-```
-# .cargo/config.toml
-[env]
-PYO3_PYTHON = "C:\\Users\\travis.hammond\\AppData\\Roaming\\uv\\python\\cpython-3.12.0-windows-x86_64-none\\python.exe"
-```
-
-5) Run:
+### Tasks
 
 ```bash
-uv run ./examples/showcase_dsp.py
+uv run poe ext_build   # compile
+uv run poe test_ext    # run tests (smoke + property)
+uv run poe lint        # ruff
 ```
-
-6) Lint
-
-```bash
-uvx ruff check
-cargo fmt
-```
-
-## Todo
-
-- Add more features
-- Add more tests

@@ -1,3 +1,4 @@
+use crate::util::list_f64_dtype;
 use polars::chunked_array::builder::AnonymousListBuilder;
 use polars::prelude::*;
 use pyo3_polars::derive::polars_expr;
@@ -249,7 +250,10 @@ fn list_struct_fields(field: &Field) -> PolarsResult<Vec<Field>> {
     }
 }
 
-fn join_output_type(input_fields: &[Field], kwargs: ListJoinKwargs) -> PolarsResult<Field> {
+fn join_output_type(
+    input_fields: &[Field],
+    kwargs: ListJoinKwargs,
+) -> PolarsResult<Field> {
     let left_fields = list_struct_fields(&input_fields[0])?;
     let right_fields = list_struct_fields(&input_fields[1])?;
 
@@ -296,26 +300,29 @@ fn join_output_type(input_fields: &[Field], kwargs: ListJoinKwargs) -> PolarsRes
 /// - `inner` / `left`: `List[Struct{left fields..., right non-key fields...}]`
 /// - `anti`: `List[Struct{left fields...}]`
 #[polars_expr(output_type_func_with_kwargs = join_output_type)]
-fn expr_list_join(inputs: &[Series], kwargs: ListJoinKwargs) -> PolarsResult<Series> {
+fn expr_list_join(
+    inputs: &[Series],
+    kwargs: ListJoinKwargs,
+) -> PolarsResult<Series> {
     let lhs_ca = inputs[0].list()?;
     let rhs_ca = inputs[1].list()?;
 
     // Validate key presence in both inner struct schemas.
-    let left_inner_fields: Vec<Field> = list_struct_fields(&Field::new(
-        PlSmallStr::EMPTY,
-        inputs[0].dtype().clone(),
-    ))?;
-    let right_inner_fields: Vec<Field> = list_struct_fields(&Field::new(
-        PlSmallStr::EMPTY,
-        inputs[1].dtype().clone(),
-    ))?;
+    let left_inner_fields: Vec<Field> =
+        list_struct_fields(&Field::new(PlSmallStr::EMPTY, inputs[0].dtype().clone()))?;
+    let right_inner_fields: Vec<Field> =
+        list_struct_fields(&Field::new(PlSmallStr::EMPTY, inputs[1].dtype().clone()))?;
 
     let left_key_idx = left_inner_fields
         .iter()
         .position(|f| f.name().as_str() == kwargs.on.as_str())
         .ok_or_else(|| {
             PolarsError::ComputeError(
-                format!("(list_ext.join): key '{}' not found in left struct", kwargs.on).into(),
+                format!(
+                    "(list_ext.join): key '{}' not found in left struct",
+                    kwargs.on
+                )
+                .into(),
             )
         })?;
     let right_key_idx = right_inner_fields
@@ -323,13 +330,19 @@ fn expr_list_join(inputs: &[Series], kwargs: ListJoinKwargs) -> PolarsResult<Ser
         .position(|f| f.name().as_str() == kwargs.on.as_str())
         .ok_or_else(|| {
             PolarsError::ComputeError(
-                format!("(list_ext.join): key '{}' not found in right struct", kwargs.on).into(),
+                format!(
+                    "(list_ext.join): key '{}' not found in right struct",
+                    kwargs.on
+                )
+                .into(),
             )
         })?;
 
     // Map right non-key field indices → output names.
-    let left_names: std::collections::HashSet<&str> =
-        left_inner_fields.iter().map(|f| f.name().as_str()).collect();
+    let left_names: std::collections::HashSet<&str> = left_inner_fields
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
     let right_non_key: Vec<(usize, PlSmallStr)> = right_inner_fields
         .iter()
         .enumerate()
@@ -465,4 +478,539 @@ fn join_row(
 
     StructChunked::from_series(PlSmallStr::EMPTY, n_out, out_series.iter())
         .map(|sc| sc.into_series())
+}
+// ── expr_list_enumerate ──────────────────────────────────────────────────────
+
+/// Zip each list element with its 0-based index producing
+/// `List[Struct{index: UInt32, value: T}]`.
+///
+/// ## Parameters
+/// - `inputs[0]`: `List[T]`
+///
+/// ## Return value
+/// `List[Struct{index: UInt32, value: T}]`
+#[polars_expr(output_type_func = enumerate_output_type)]
+fn expr_list_enumerate(inputs: &[Series]) -> PolarsResult<Series> {
+    let ca = inputs[0].list()?;
+    let inner_t = match ca.dtype() {
+        DataType::List(inner) => *inner.clone(),
+        _ => unreachable!(),
+    };
+    let out_dtype = DataType::Struct(vec![
+        Field::new(PlSmallStr::from_static("index"), DataType::UInt32),
+        Field::new(PlSmallStr::from_static("value"), inner_t),
+    ]);
+    let n_rows = ca.len();
+    let rows: PolarsResult<Vec<Option<Series>>> = ca
+        .into_iter()
+        .map(|opt| match opt {
+            None => Ok(None),
+            Some(s) => {
+                let len = s.len();
+                let idx = Series::new(
+                    PlSmallStr::from_static("index"),
+                    (0u32..len as u32).collect::<Vec<_>>(),
+                );
+                let val = s.with_name(PlSmallStr::from_static("value"));
+                StructChunked::from_series(PlSmallStr::EMPTY, len, [idx, val].iter())
+                    .map(|sc| Some(sc.into_series()))
+            }
+        })
+        .collect();
+    let rows = rows?;
+    let mut builder =
+        AnonymousListBuilder::new(PlSmallStr::EMPTY, n_rows, Some(out_dtype.clone()));
+    for row in &rows {
+        match row {
+            Some(s) => builder.append_series(s)?,
+            None => builder.append_null(),
+        }
+    }
+    builder
+        .finish()
+        .into_series()
+        .cast(&DataType::List(Box::new(out_dtype)))
+}
+
+fn enumerate_output_type(input_fields: &[Field]) -> PolarsResult<Field> {
+    let inner_t = match input_fields[0].dtype() {
+        DataType::List(inner) => *inner.clone(),
+        dt => {
+            return Err(PolarsError::ComputeError(
+                format!("(list_ext.enumerate): expected List, got {dt}").into(),
+            ))
+        }
+    };
+    Ok(Field::new(
+        input_fields[0].name.clone(),
+        DataType::List(Box::new(DataType::Struct(vec![
+            Field::new(PlSmallStr::from_static("index"), DataType::UInt32),
+            Field::new(PlSmallStr::from_static("value"), inner_t),
+        ]))),
+    ))
+}
+
+// ── expr_list_dedup ──────────────────────────────────────────────────────────
+
+/// Remove consecutive duplicate elements from each list (like Unix `uniq`).
+///
+/// Only adjacent duplicates are removed. Uses string-cast equality so works
+/// for any dtype that serialises unambiguously. Null elements are treated as
+/// equal to each other.
+///
+/// ## Parameters
+/// - `inputs[0]`: `List[T]`
+///
+/// ## Return value
+/// `List[T]` with consecutive duplicates removed.
+#[polars_expr(output_type_func = same_inner_type)]
+fn expr_list_dedup(inputs: &[Series]) -> PolarsResult<Series> {
+    let ca = inputs[0].list()?;
+    let inner_t = match ca.dtype() {
+        DataType::List(inner) => *inner.clone(),
+        _ => unreachable!(),
+    };
+    let n_rows = ca.len();
+    let rows: PolarsResult<Vec<Option<Series>>> = ca
+        .into_iter()
+        .map(|opt| match opt {
+            None => Ok(None),
+            Some(s) => {
+                if s.is_empty() {
+                    return Ok(Some(Series::new_empty(PlSmallStr::EMPTY, &inner_t)));
+                }
+                let str_rep = s.cast(&DataType::String)?;
+                let str_ca = str_rep.str()?;
+                let mut keep: Vec<u32> = vec![0];
+                for i in 1..s.len() {
+                    if str_ca.get(i) != str_ca.get(i - 1) {
+                        keep.push(i as u32);
+                    }
+                }
+                let idx = IdxCa::from_vec(PlSmallStr::EMPTY, keep);
+                Ok(Some(s.take(&idx)?))
+            }
+        })
+        .collect();
+    let rows = rows?;
+    let mut builder =
+        AnonymousListBuilder::new(PlSmallStr::EMPTY, n_rows, Some(inner_t.clone()));
+    for row in &rows {
+        match row {
+            Some(s) => builder.append_series(s)?,
+            None => builder.append_null(),
+        }
+    }
+    builder
+        .finish()
+        .into_series()
+        .cast(&DataType::List(Box::new(inner_t)))
+}
+
+// ── expr_list_rotate ─────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct RotateKwargs {
+    n: i64,
+}
+
+/// Rotate list elements by `n` positions (positive = right, negative = left).
+///
+/// ## Parameters
+/// - `inputs[0]`: `List[T]`
+/// - `n`: rotation amount; wraps modulo list length.
+///
+/// ## Return value
+/// `List[T]`
+#[polars_expr(output_type_func = same_inner_type)]
+fn expr_list_rotate(
+    inputs: &[Series],
+    kwargs: RotateKwargs,
+) -> PolarsResult<Series> {
+    let ca = inputs[0].list()?;
+    let inner_t = match ca.dtype() {
+        DataType::List(inner) => *inner.clone(),
+        _ => unreachable!(),
+    };
+    let n_rows = ca.len();
+    let rows: PolarsResult<Vec<Option<Series>>> = ca
+        .into_iter()
+        .map(|opt| match opt {
+            None => Ok(None),
+            Some(s) => {
+                let len = s.len();
+                if len == 0 {
+                    return Ok(Some(s));
+                }
+                let shift = kwargs.n.rem_euclid(len as i64) as usize;
+                if shift == 0 {
+                    return Ok(Some(s));
+                }
+                // right-rotate by `shift`: last `shift` elements come first.
+                // Build rotated index order and gather in one pass.
+                let split = len - shift;
+                let idx: Vec<u32> =
+                    (split..len).chain(0..split).map(|i| i as u32).collect();
+                let idx_ca = IdxCa::from_vec(PlSmallStr::EMPTY, idx);
+                Ok(Some(s.take(&idx_ca)?))
+            }
+        })
+        .collect();
+    let rows = rows?;
+    let mut builder =
+        AnonymousListBuilder::new(PlSmallStr::EMPTY, n_rows, Some(inner_t.clone()));
+    for row in &rows {
+        match row {
+            Some(s) => builder.append_series(s)?,
+            None => builder.append_null(),
+        }
+    }
+    builder
+        .finish()
+        .into_series()
+        .cast(&DataType::List(Box::new(inner_t)))
+}
+
+// ── expr_list_windows ────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct WindowsKwargs {
+    size: usize,
+    step: usize,
+}
+
+fn windows_output_type(input_fields: &[Field]) -> PolarsResult<Field> {
+    let inner_t = match input_fields[0].dtype() {
+        DataType::List(inner) => *inner.clone(),
+        dt => {
+            return Err(PolarsError::ComputeError(
+                format!("(list_ext.windows): expected List, got {dt}").into(),
+            ))
+        }
+    };
+    Ok(Field::new(
+        input_fields[0].name.clone(),
+        DataType::List(Box::new(DataType::List(Box::new(inner_t)))),
+    ))
+}
+
+/// Produce a sliding window view of each list as `List[List[T]]`.
+///
+/// ## Parameters
+/// - `inputs[0]`: `List[T]`
+/// - `size`: window size (must be > 0)
+/// - `step`: step between window starts (default 1, must be > 0)
+///
+/// ## Return value
+/// `List[List[T]]` — each inner list has exactly `size` elements. Lists
+/// shorter than `size` produce an empty outer list.
+#[polars_expr(output_type_func = windows_output_type)]
+fn expr_list_windows(
+    inputs: &[Series],
+    kwargs: WindowsKwargs,
+) -> PolarsResult<Series> {
+    if kwargs.size == 0 || kwargs.step == 0 {
+        return Err(PolarsError::ComputeError(
+            "(list_ext.windows): size and step must be > 0".into(),
+        ));
+    }
+    let ca = inputs[0].list()?;
+    let inner_t = match ca.dtype() {
+        DataType::List(inner) => *inner.clone(),
+        _ => unreachable!(),
+    };
+    let inner_list_t = DataType::List(Box::new(inner_t.clone()));
+    let n_rows = ca.len();
+
+    // Each outer row is itself a List[List[T]].
+    let rows: PolarsResult<Vec<Option<Series>>> = ca
+        .into_iter()
+        .map(|opt| match opt {
+            None => Ok(None),
+            Some(s) => {
+                let len = s.len();
+                if len < kwargs.size {
+                    // Return empty List[List[T]].
+                    let empty_inner = Series::new_empty(PlSmallStr::EMPTY, &inner_t);
+                    let mut b = AnonymousListBuilder::new(
+                        PlSmallStr::EMPTY,
+                        0,
+                        Some(inner_t.clone()),
+                    );
+                    let _ = b.append_series(&empty_inner); // unused; just for type
+                    drop(b);
+                    let mut outer = AnonymousListBuilder::new(
+                        PlSmallStr::EMPTY,
+                        0,
+                        Some(inner_t.clone()),
+                    );
+                    return Ok(Some(outer.finish().into_series().cast(&inner_list_t)?));
+                }
+                let n_windows = (len - kwargs.size) / kwargs.step + 1;
+                let windows_vec: Vec<Series> = (0..len)
+                    .step_by(kwargs.step)
+                    .take_while(|&start| start + kwargs.size <= len)
+                    .map(|start| s.slice(start as i64, kwargs.size))
+                    .collect();
+                let mut outer = AnonymousListBuilder::new(
+                    PlSmallStr::EMPTY,
+                    n_windows,
+                    Some(inner_t.clone()),
+                );
+                for w in &windows_vec {
+                    outer.append_series(w)?;
+                }
+                Ok(Some(outer.finish().into_series().cast(&inner_list_t)?))
+            }
+        })
+        .collect();
+    let rows = rows?;
+    let mut builder =
+        AnonymousListBuilder::new(PlSmallStr::EMPTY, n_rows, Some(inner_list_t.clone()));
+    for row in &rows {
+        match row {
+            Some(s) => builder.append_series(s)?,
+            None => builder.append_null(),
+        }
+    }
+    builder
+        .finish()
+        .into_series()
+        .cast(&DataType::List(Box::new(inner_list_t)))
+}
+
+// ── expr_list_chunks ─────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ChunksKwargs {
+    size: usize,
+}
+
+/// Partition each list into non-overlapping chunks of `size` as `List[List[T]]`.
+///
+/// The last chunk may be smaller than `size` if the list length is not a
+/// multiple of `size`.
+///
+/// ## Parameters
+/// - `inputs[0]`: `List[T]`
+/// - `size`: chunk size (must be > 0)
+///
+/// ## Return value
+/// `List[List[T]]`
+#[polars_expr(output_type_func = windows_output_type)]
+fn expr_list_chunks(
+    inputs: &[Series],
+    kwargs: ChunksKwargs,
+) -> PolarsResult<Series> {
+    if kwargs.size == 0 {
+        return Err(PolarsError::ComputeError(
+            "(list_ext.chunks): size must be > 0".into(),
+        ));
+    }
+    let ca = inputs[0].list()?;
+    let inner_t = match ca.dtype() {
+        DataType::List(inner) => *inner.clone(),
+        _ => unreachable!(),
+    };
+    let inner_list_t = DataType::List(Box::new(inner_t.clone()));
+    let n_rows = ca.len();
+
+    let rows: PolarsResult<Vec<Option<Series>>> = ca
+        .into_iter()
+        .map(|opt| match opt {
+            None => Ok(None),
+            Some(s) => {
+                let len = s.len();
+                let n_chunks = len.div_ceil(kwargs.size).max(1);
+                let mut outer = AnonymousListBuilder::new(
+                    PlSmallStr::EMPTY,
+                    n_chunks,
+                    Some(inner_t.clone()),
+                );
+                if len == 0 {
+                    return Ok(Some(outer.finish().into_series().cast(&inner_list_t)?));
+                }
+                let chunks_vec: Vec<Series> = (0..len)
+                    .step_by(kwargs.size)
+                    .map(|start| {
+                        let end = (start + kwargs.size).min(len);
+                        s.slice(start as i64, end - start)
+                    })
+                    .collect();
+                for chunk in &chunks_vec {
+                    outer.append_series(chunk)?;
+                }
+                Ok(Some(outer.finish().into_series().cast(&inner_list_t)?))
+            }
+        })
+        .collect();
+    let rows = rows?;
+    let mut builder =
+        AnonymousListBuilder::new(PlSmallStr::EMPTY, n_rows, Some(inner_list_t.clone()));
+    for row in &rows {
+        match row {
+            Some(s) => builder.append_series(s)?,
+            None => builder.append_null(),
+        }
+    }
+    builder
+        .finish()
+        .into_series()
+        .cast(&DataType::List(Box::new(inner_list_t)))
+}
+
+// ── expr_list_position ───────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct PositionKwargs {
+    op: String,
+    value: f64,
+}
+
+/// Return the 0-based index of the first element matching the given condition,
+/// or `null` if no element matches.
+///
+/// ## Parameters
+/// - `inputs[0]`: `List[T]` (cast to `List[Float64]` internally)
+/// - `op`: comparison operator — `"eq"` | `"ne"` | `"gt"` | `"ge"` | `"lt"` | `"le"`
+/// - `value`: the comparison value
+///
+/// ## Return value
+/// `UInt32` — index of first match, or `null`.
+#[polars_expr(output_type = UInt32)]
+fn expr_list_position(
+    inputs: &[Series],
+    kwargs: PositionKwargs,
+) -> PolarsResult<Series> {
+    let ca = inputs[0]
+        .cast(&DataType::List(Box::new(DataType::Float64)))?
+        .list()?
+        .clone();
+    let valid_ops = ["eq", "ne", "gt", "ge", "lt", "le"];
+    if !valid_ops.contains(&kwargs.op.as_str()) {
+        return Err(PolarsError::ComputeError(
+            format!(
+                "(list_ext.position): op must be one of [{}], got {:?}",
+                valid_ops.join(", "),
+                kwargs.op
+            )
+            .into(),
+        ));
+    }
+    let out: UInt32Chunked = ca
+        .into_iter()
+        .map(|opt| match opt {
+            None => None,
+            Some(s) => {
+                let f = s.f64().ok()?;
+                f.iter().enumerate().find_map(|(i, v)| {
+                    let matches = match (kwargs.op.as_str(), v) {
+                        (_, None) => false,
+                        ("eq", Some(x)) => x == kwargs.value,
+                        ("ne", Some(x)) => x != kwargs.value,
+                        ("gt", Some(x)) => x > kwargs.value,
+                        ("ge", Some(x)) => x >= kwargs.value,
+                        ("lt", Some(x)) => x < kwargs.value,
+                        ("le", Some(x)) => x <= kwargs.value,
+                        _ => false,
+                    };
+                    if matches {
+                        Some(i as u32)
+                    } else {
+                        None
+                    }
+                })
+            }
+        })
+        .collect();
+    Ok(out.into_series())
+}
+
+// ── expr_list_flat_map ───────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct FlatMapKwargs {
+    op: String,
+    value: f64,
+}
+
+/// Apply an element-wise map then flatten one level: equivalent to
+/// `list.eval(...).explode()` but in a single pass.
+///
+/// The supported operations are arithmetic transforms on `List[Float64]`.
+///
+/// ## Parameters
+/// - `inputs[0]`: `List[List[T]]` (outer list to flatten after mapping)
+///   *or* `List[T]` when used as a map+flatten on a single list
+/// - `op`: `"add"` | `"sub"` | `"mul"` | `"div"`
+/// - `value`: scalar to apply
+///
+/// ## Return value
+/// `List[Float64]` — mapped and flattened.
+#[polars_expr(output_type_func = list_f64_dtype)]
+fn expr_list_flat_map(
+    inputs: &[Series],
+    kwargs: FlatMapKwargs,
+) -> PolarsResult<Series> {
+    let valid_ops = ["add", "sub", "mul", "div"];
+    if !valid_ops.contains(&kwargs.op.as_str()) {
+        return Err(PolarsError::ComputeError(
+            format!(
+                "(list_ext.flat_map): op must be one of [{}], got {:?}",
+                valid_ops.join(", "),
+                kwargs.op
+            )
+            .into(),
+        ));
+    }
+    // Cast outer list elements to Float64.
+    let ca = inputs[0]
+        .cast(&DataType::List(Box::new(DataType::Float64)))?
+        .list()?
+        .clone();
+    let n_rows = ca.len();
+    // Collect mapped+flattened values per row.
+    let rows: Vec<Option<Series>> = ca
+        .into_iter()
+        .map(|opt| match opt {
+            None => None,
+            Some(s) => {
+                let f = s.f64().ok()?;
+                let mapped: Vec<Option<f64>> = f
+                    .iter()
+                    .map(|v| {
+                        v.map(|x| match kwargs.op.as_str() {
+                            "add" => x + kwargs.value,
+                            "sub" => x - kwargs.value,
+                            "mul" => x * kwargs.value,
+                            "div" => x / kwargs.value,
+                            _ => unreachable!(),
+                        })
+                    })
+                    .collect();
+                Some(Series::new(PlSmallStr::EMPTY, mapped))
+            }
+        })
+        .collect();
+    let mut builder =
+        AnonymousListBuilder::new(PlSmallStr::EMPTY, n_rows, Some(DataType::Float64));
+    for row in &rows {
+        match row {
+            Some(s) => builder.append_series(s)?,
+            None => builder.append_null(),
+        }
+    }
+    builder
+        .finish()
+        .into_series()
+        .cast(&DataType::List(Box::new(DataType::Float64)))
+}
+
+// ── shared output type helper ─────────────────────────────────────────────────
+
+fn same_inner_type(input_fields: &[Field]) -> PolarsResult<Field> {
+    Ok(Field::new(
+        input_fields[0].name.clone(),
+        input_fields[0].dtype().clone(),
+    ))
 }

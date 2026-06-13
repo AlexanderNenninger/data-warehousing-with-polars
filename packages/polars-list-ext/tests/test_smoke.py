@@ -147,3 +147,86 @@ def test_join_suffix_on_name_collision():
     row = j[0][0]
     assert row["val"] == 42  # left val
     assert row["val_b"] == "x"  # right val with suffix
+
+
+# ── list_ext namespace: enumerate / dedup / rotate / windows / chunks / position / flat_map ──
+
+
+def test_enumerate_basic():
+    df = pl.DataFrame({"xs": [["a", "b", "c"]]})
+    out = df.with_columns(pl.col("xs").list_ext.enumerate().alias("e"))
+    rows = out["e"].to_list()
+    assert rows[0][0] == {"index": 0, "value": "a"}
+    assert rows[0][2] == {"index": 2, "value": "c"}
+
+
+def test_dedup_removes_consecutive_duplicates():
+    df = pl.DataFrame({"xs": [[1, 1, 2, 3, 3, 3, 2, 2]]}, schema={"xs": pl.List(pl.Int64)})
+    out = df.with_columns(pl.col("xs").list_ext.dedup().alias("d"))
+    assert out["d"].to_list() == [[1, 2, 3, 2]]
+
+
+def test_dedup_keeps_non_adjacent_duplicates():
+    df = pl.DataFrame({"xs": [[1, 2, 1, 2]]}, schema={"xs": pl.List(pl.Int64)})
+    out = df.with_columns(pl.col("xs").list_ext.dedup().alias("d"))
+    assert out["d"].to_list() == [[1, 2, 1, 2]]
+
+
+def test_rotate_right():
+    df = pl.DataFrame({"xs": [[1, 2, 3, 4, 5]]}, schema={"xs": pl.List(pl.Int64)})
+    out = df.with_columns(pl.col("xs").list_ext.rotate(2).alias("r"))
+    assert out["r"].to_list() == [[4, 5, 1, 2, 3]]
+
+
+def test_rotate_left():
+    df = pl.DataFrame({"xs": [[1, 2, 3, 4, 5]]}, schema={"xs": pl.List(pl.Int64)})
+    out = df.with_columns(pl.col("xs").list_ext.rotate(-2).alias("r"))
+    assert out["r"].to_list() == [[3, 4, 5, 1, 2]]
+
+
+def test_windows_basic():
+    df = pl.DataFrame({"xs": [[1, 2, 3, 4, 5]]}, schema={"xs": pl.List(pl.Int64)})
+    out = df.with_columns(pl.col("xs").list_ext.windows(3).alias("w"))
+    assert out["w"].to_list() == [[[1, 2, 3], [2, 3, 4], [3, 4, 5]]]
+
+
+def test_windows_with_step():
+    df = pl.DataFrame({"xs": [[1, 2, 3, 4, 5, 6]]}, schema={"xs": pl.List(pl.Int64)})
+    out = df.with_columns(pl.col("xs").list_ext.windows(3, step=2).alias("w"))
+    assert out["w"].to_list() == [[[1, 2, 3], [3, 4, 5]]]
+
+
+def test_windows_shorter_than_size_returns_empty():
+    df = pl.DataFrame({"xs": [[1, 2]]}, schema={"xs": pl.List(pl.Int64)})
+    out = df.with_columns(pl.col("xs").list_ext.windows(5).alias("w"))
+    assert out["w"].list.len().to_list() == [0]
+
+
+def test_chunks_basic():
+    df = pl.DataFrame({"xs": [[1, 2, 3, 4, 5]]}, schema={"xs": pl.List(pl.Int64)})
+    out = df.with_columns(pl.col("xs").list_ext.chunks(2).alias("c"))
+    assert out["c"].to_list() == [[[1, 2], [3, 4], [5]]]
+
+
+def test_chunks_exact_division():
+    df = pl.DataFrame({"xs": [[1, 2, 3, 4]]}, schema={"xs": pl.List(pl.Int64)})
+    out = df.with_columns(pl.col("xs").list_ext.chunks(2).alias("c"))
+    assert out["c"].to_list() == [[[1, 2], [3, 4]]]
+
+
+def test_position_finds_first_match():
+    df = pl.DataFrame({"xs": [[1.0, 2.0, 3.0, 2.0]]})
+    out = df.with_columns(pl.col("xs").list_ext.position("eq", 2.0).alias("p"))
+    assert out["p"].to_list() == [1]
+
+
+def test_position_returns_null_when_no_match():
+    df = pl.DataFrame({"xs": [[1.0, 2.0, 3.0]]})
+    out = df.with_columns(pl.col("xs").list_ext.position("gt", 10.0).alias("p"))
+    assert out["p"].to_list() == [None]
+
+
+def test_flat_map_mul():
+    df = pl.DataFrame({"xs": [[1.0, 2.0, 3.0]]})
+    out = df.with_columns(pl.col("xs").list_ext.flat_map("mul", 2.0).alias("m"))
+    assert out["m"].to_list() == [[2.0, 4.0, 6.0]]

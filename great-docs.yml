@@ -101,6 +101,13 @@ reference:
       - list_ext.ListExtNamespace.zip
       - list_ext.ListExtNamespace.unzip
       - list_ext.ListExtNamespace.join
+      - list_ext.ListExtNamespace.enumerate
+      - list_ext.ListExtNamespace.dedup
+      - list_ext.ListExtNamespace.rotate
+      - list_ext.ListExtNamespace.windows
+      - list_ext.ListExtNamespace.chunks
+      - list_ext.ListExtNamespace.position
+      - list_ext.ListExtNamespace.flat_map
 
 sections:
   - title: Blog
