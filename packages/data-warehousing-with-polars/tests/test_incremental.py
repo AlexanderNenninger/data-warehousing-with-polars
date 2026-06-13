@@ -4,7 +4,6 @@ from typing import Literal, cast
 
 import polars as pl
 import pytest
-
 from data_warehousing_with_polars.incremental import (
     Batch,
     FrameSource,

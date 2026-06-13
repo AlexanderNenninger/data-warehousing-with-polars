@@ -2,13 +2,12 @@
 
 import polars as pl
 import pytest
-from deltalake import write_deltalake
-
 from data_warehousing_with_polars.maintenance import (
     _load_run_count,
     _save_run_count,
     maintain,
 )
+from deltalake import write_deltalake
 
 # ── Run counter ───────────────────────────────────────────────────────────────
 

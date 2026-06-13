@@ -4,8 +4,6 @@ from datetime import date
 from pathlib import Path
 
 import polars as pl
-from deltalake import DeltaTable, write_deltalake
-
 from data_warehousing_with_polars.scd import (
     _partition_predicate,
     _sink_scd2,
@@ -13,6 +11,7 @@ from data_warehousing_with_polars.scd import (
     _sql_literal,
     _upsert_overwrite,
 )
+from deltalake import DeltaTable, write_deltalake
 
 # ── _sink_scd2 ────────────────────────────────────────────────────────────────
 

@@ -1,0 +1,11 @@
+*.so
+*.pyc
+target
+venv
+.venv
+*.so
+*.dll
+*.pyd
+.cargo/
+test.py
+.vscode

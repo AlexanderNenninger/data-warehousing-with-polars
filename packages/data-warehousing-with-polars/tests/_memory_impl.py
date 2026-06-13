@@ -20,7 +20,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import polars as pl  # noqa: E402
 from conftest import _RSSMeasurement  # noqa  # ty:ignore[unresolved-import]
-
 from data_warehousing_with_polars.incremental import incremental  # noqa: E402
 
 # ── Constants (kept in sync with test_memory.py) ──────────────────────────────

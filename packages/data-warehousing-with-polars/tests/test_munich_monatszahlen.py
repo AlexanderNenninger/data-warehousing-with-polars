@@ -14,9 +14,10 @@ import pytest
 # Import helpers
 # ---------------------------------------------------------------------------
 
-# The app module lives under app/, which is not a package.  Add the repo root
-# to sys.path so we can import it directly.
-sys.path.insert(0, str(Path(__file__).parent.parent / "app"))
+# The app module lives under app/ at the repo root (this package sits at
+# packages/data-warehousing-with-polars/), which is not a package.  Add it to
+# sys.path so we can import it directly.
+sys.path.insert(0, str(Path(__file__).parents[3] / "app"))
 
 from munich_monatszahlen import (  # noqa: E402
     _CKAN_SLUGS,

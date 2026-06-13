@@ -2,7 +2,6 @@
 
 import polars as pl
 import pyarrow as pa
-
 from data_warehousing_with_polars.record_batch_source import make_lazy
 
 

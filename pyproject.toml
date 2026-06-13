@@ -1,28 +1,15 @@
-[project]
-name = "data-warehousing-with-polars"
-version = "0.1.0"
-description = "ACID data warehousing with Polars and Delta Lake"
-readme = "README.md"
-requires-python = ">=3.12"
-dependencies = ["polars>=1.30.0", "deltalake>=0.22.3", "pyarrow>=19.0.0"]
-
-[project.optional-dependencies]
-cloud = ["polars-cloud>=0.6.3"]
-
-[project.urls]
-repository = "https://github.com/AlexanderNenninger/data-warehousing-with-polars"
-
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[build-system]
-requires = ["setuptools>=61.0", "wheel"]
-build-backend = "setuptools.build_meta"
+# Workspace root for the monorepo. This is a "virtual" root (no [project] of its
+# own); the installable packages live under packages/*.
+[tool.uv.workspace]
+members = ["packages/*"]
 
 [dependency-groups]
 dev = [
     "altair>=6.1.0",
     "great-docs>=0.11.0",
+    "matplotlib>=3.4.0",
+    "maturin>=1.0,<2.0",
+    "numpy>=2.2.3",
     "poethepoet>=0.46.0",
     "psutil>=7.2.2",
     "pytest>=9.0.3",
@@ -36,26 +23,27 @@ dev = [
 [tool.ruff]
 line-length = 100
 
-[tool.ty.rules]
-redundant-cast = "ignore"
-
-
 [tool.ruff.lint]
 select = ["E", "F", "I"]
 
+[tool.ty.rules]
+redundant-cast = "ignore"
+
+# Paths below are relative to the repo root. Quality tasks cover every package's
+# source + tests (plugin examples are demo scripts and excluded, like the
+# data-warehousing examples). qa runs the whole monorepo.
 [tool.poe.tasks]
-fmt = "ruff format src tests app"
-lint = "ruff check src tests app --fix --unsafe-fixes"
-typecheck = "ty check src app"
-test = "pytest tests/ --ignore=tests/test_memory.py -v -m 'not slow'"
-test_memory = "pytest tests/test_memory.py -v"
-test_cloud = "pytest tests/test_cloud.py -v"
-test_min_versions.sequence = [
-    { cmd = "uv sync --resolution=lowest-direct" },
-    { cmd = "pytest tests/ --ignore=tests/test_memory.py -v" },
-    { cmd = "uv sync" },
-]
-qa.sequence = ["fmt", "lint", "typecheck", "test", "test_memory"]
+fmt = "ruff format packages/data-warehousing-with-polars packages/polars-list-ext/polars_list_ext packages/polars-list-ext/tests app"
+lint = "ruff check packages/data-warehousing-with-polars packages/polars-list-ext/polars_list_ext packages/polars-list-ext/tests app --fix --unsafe-fixes"
+typecheck = "ty check packages/data-warehousing-with-polars/src packages/polars-list-ext/polars_list_ext app"
+test = "pytest packages/data-warehousing-with-polars/tests --ignore=packages/data-warehousing-with-polars/tests/test_memory.py -v -m 'not slow'"
+test_memory = "pytest packages/data-warehousing-with-polars/tests/test_memory.py -v"
+test_cloud = "pytest packages/data-warehousing-with-polars/tests/test_cloud.py -v"
+test_ext = "pytest packages/polars-list-ext/tests -v"
+qa.sequence = ["fmt", "lint", "typecheck", "test", "test_memory", "test_ext"]
+
+# ── polars-list-ext (Rust plugin) build ────────────────────────────────────────
+ext_build = "maturin develop --release --manifest-path packages/polars-list-ext/Cargo.toml"
 
 # ── Pipelines ──────────────────────────────────────────────────────────────────
 monatszahlen = "python app/munich_monatszahlen.py"

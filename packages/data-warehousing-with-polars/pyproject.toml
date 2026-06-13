@@ -1,0 +1,19 @@
+[project]
+name = "data-warehousing-with-polars"
+version = "0.1.0"
+description = "ACID data warehousing with Polars and Delta Lake"
+requires-python = ">=3.12"
+dependencies = ["polars>=1.30.0", "deltalake>=0.22.3", "pyarrow>=19.0.0"]
+
+[project.optional-dependencies]
+cloud = ["polars-cloud>=0.6.3"]
+
+[project.urls]
+repository = "https://github.com/AlexanderNenninger/data-warehousing-with-polars"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"

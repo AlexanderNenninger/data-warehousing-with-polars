@@ -2,7 +2,6 @@
 
 import polars as pl
 import pytest
-
 from data_warehousing_with_polars.schema import SchemaError, SchemaViolation, schema
 
 # ── SchemaViolation ───────────────────────────────────────────────────────────

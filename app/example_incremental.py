@@ -3,7 +3,6 @@
 import logging
 
 import polars as pl
-
 from data_warehousing_with_polars import incremental
 
 # Configure logging to see pipeline progress

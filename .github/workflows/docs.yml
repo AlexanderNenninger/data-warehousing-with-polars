@@ -25,14 +25,13 @@ jobs:
       - name: Install package and dependencies
         run: |
           python -m pip install uv
-          uv sync --all-groups --all-extras
-          uv pip install great-docs
+          uv sync --package data-warehousing-with-polars --all-extras
 
       - name: Set up Quarto
         uses: quarto-dev/quarto-actions/setup@v2
 
       - name: Build docs
-        run: uv run --all-groups --all-extras great-docs build
+        run: uv run --package data-warehousing-with-polars great-docs build
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
