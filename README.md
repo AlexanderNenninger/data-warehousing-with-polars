@@ -1,13 +1,28 @@
 # Data Warehousing with Polars
 
-A Python library for building incremental data pipelines on top of [Polars](https://pola.rs) and [Delta Lake](https://delta.io). Handles file tracking, deduplication, SCD semantics, schema validation, and table maintenance so transform functions stay focused on business logic.
+A [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/) monorepo of [Polars](https://pola.rs)-centric packages.
+
+## Packages
+
+| Package | Path | What it is |
+| --- | --- | --- |
+| [`data-warehousing-with-polars`](packages/data-warehousing-with-polars/) | `packages/data-warehousing-with-polars/` | Incremental data pipelines on Polars + [Delta Lake](https://delta.io): file tracking, deduplication, SCD semantics, schema validation, and table maintenance. Documented in detail below. |
+| [`polars-list-ext`](packages/polars-list-ext/) | `packages/polars-list-ext/` | A Rust Polars expression plugin for List-column signal processing and feature extraction (FFT, Butterworth filters, element-wise aggregation). See [its README](packages/polars-list-ext/README.md). |
+
+The two packages are independent — neither depends on the other.
 
 ## Installation
 
 ```bash
 git clone <repo-url>
 cd data-warehousing-with-polars
-uv pip install -e .
+uv sync --all-extras          # installs both packages into one environment
+```
+
+`uv sync` builds the `polars-list-ext` Rust extension, so a [Rust toolchain](https://rustup.rs) is required for a full install. To install only the pure-Python data-warehousing package (no Rust needed):
+
+```bash
+uv sync --package data-warehousing-with-polars
 ```
 
 ## Concepts
@@ -332,18 +347,34 @@ def clean(lf: pl.LazyFrame) -> pl.LazyFrame:
     return lf
 ```
 
+## polars-list-ext
+
+The `polars-list-ext` package (import `polars_list_ext`) is a Rust [Polars plugin](https://docs.pola.rs/user-guide/plugins/) providing expressions for List-type columns — FFT, windowing, Butterworth filters, element-wise aggregation, interpolation, and range features. It is built and installed by `uv sync`.
+
+```python
+import polars as pl
+import polars_list_ext as ple
+
+df = pl.DataFrame({"signal": [[0.0, 1.0, 0.0, -1.0] * 4]})
+df.with_columns(ple.apply_fft("signal", sample_rate=16).alias("fft"))
+```
+
+See the [package README](packages/polars-list-ext/README.md) for the full function list. It is derived from [`polars_list_utils`](https://github.com/dashdeckers/polars_list_utils) by Travis Hammond, modified for use here (attribution in its README).
+
 ## Development
 
 ```bash
-# Run full QA (format, lint, typecheck, tests)
+# Run full QA across all packages (format, lint, typecheck, tests)
 poe qa
 
 # Individual steps
-poe fmt          # ruff format
-poe lint         # ruff check --fix
-poe typecheck    # ty check
-poe test         # pytest (excludes memory tests)
+poe fmt          # ruff format (both packages)
+poe lint         # ruff check --fix (both packages)
+poe typecheck    # ty check (both packages)
+poe test         # data-warehousing pytest (excludes memory tests)
 poe test_memory  # memory-boundedness tests (each in a fresh subprocess)
+poe test_ext     # polars-list-ext smoke tests
+poe ext_build    # rebuild the Rust plugin (maturin develop --release)
 
 # Demo pipelines (require AWS credentials in .env)
 poe monatszahlen   # munich_monatszahlen.py
@@ -358,9 +389,10 @@ poe docs_preview   # great-docs preview (local server)
 ## Requirements
 
 - Python >= 3.12
-- polars >= 1.41.0
+- polars >= 1.30.0
 - deltalake >= 0.22.3
 - pyarrow >= 19.0.0
+- A [Rust toolchain](https://rustup.rs) to build `polars-list-ext` (not needed if you install only the data-warehousing package)
 
 ## License
 

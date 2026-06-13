@@ -1,11 +1,12 @@
 # Great Docs Configuration
 # See https://posit-dev.github.io/great-docs/user-guide/03-configuration.html
 
-# Module Name (optional)
+# Module Name
 # ----------------------
-# Set this if your importable module name differs from the project name.
-# Example: project 'py-yaml12' with module name 'yaml12'
-# module: yaml12
+# The workspace root is virtual (no [project]), so the documented module is set
+# explicitly. Reference `contents` below are absolute Python imports, so other
+# workspace packages (e.g. polars_list_ext) can be documented in the same site.
+module: dwp
 
 display_name: "Data Warehousing with Polars"
 
@@ -77,6 +78,22 @@ reference:
       - incremental.from_frame
       - incremental.Source
       - incremental.Batch
+
+  - title: "List Extensions: FFT"
+    desc: Fast Fourier Transform applied to Polars List columns
+    contents:
+      - list_ext.apply_fft
+      - list_ext.fft_freqs
+      - list_ext.fft_freqs_linspace
+
+  - title: "List Extensions: Operations"
+    desc: Element-wise and range-based operations on Polars List columns
+    contents:
+      - list_ext.operate_scalar_on_list
+      - list_ext.interpolate_columns
+      - list_ext.aggregate_list_col_elementwise
+      - list_ext.agg_of_range
+      - list_ext.mean_of_range
 
 sections:
   - title: Blog

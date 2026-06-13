@@ -1,5 +1,24 @@
-# Workspace root for the monorepo. This is a "virtual" root (no [project] of its
-# own); the installable packages live under packages/*.
+# Workspace root for the monorepo. The installable packages live under packages/*.
+# The root carries [project] metadata (with package = false, so it is never built
+# or installed) purely so doc tooling can detect a project name; the documented
+# module is set via `module:` in great-docs.yml.
+[project]
+name = "data-warehousing-monorepo"
+version = "0.1.0"
+requires-python = ">=3.12"
+# Pull both workspace members into the env on a plain `uv sync`. The root itself
+# is never built/installed (package = false); it exists so doc tooling detects a
+# project name. The documented module is set via `module:` in great-docs.yml.
+dependencies = ["data-warehousing-with-polars[cloud]", "polars-list-ext", "dwp"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+data-warehousing-with-polars = { workspace = true }
+polars-list-ext = { workspace = true }
+dwp = { workspace = true }
+
 [tool.uv.workspace]
 members = ["packages/*"]
 

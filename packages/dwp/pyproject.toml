@@ -1,0 +1,17 @@
+[project]
+name = "dwp"
+version = "0.1.0"
+description = "Unified docs bridge re-exporting the public APIs of both workspace packages"
+requires-python = ">=3.12"
+dependencies = ["data-warehousing-with-polars", "polars-list-ext"]
+
+[tool.uv.sources]
+data-warehousing-with-polars = { workspace = true }
+polars-list-ext = { workspace = true }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
