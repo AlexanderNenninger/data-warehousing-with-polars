@@ -173,32 +173,54 @@ def _sink_scd2(
     # Done as a full-table rewrite rather than a Delta MERGE: delta-rs 1.6's MERGE is
     # unreliable on object-store (S3) targets at scale (see _upsert_overwrite). Only
     # rows that are currently open AND whose key appears in the batch are closed.
+    #
+    # When the target is partitioned (and the partition values render into a
+    # ``replaceWhere`` predicate), the close rewrite is narrowed to *just the
+    # partitions the batch touches* — reading and overwriting only those partitions
+    # instead of the whole table, exactly as ``_upsert_overwrite`` does. This assumes
+    # a key's partition value is stable across runs (the same assumption upserts make).
     incoming = df.select(keys).unique().with_columns(pl.lit(True).alias("__match"))
     to_close = pl.col("__match").fill_null(False) & pl.col("is_current")
-    closed = (
-        pl
-        .scan_delta(target)
-        .join(incoming.lazy(), on=keys, how="left")
-        .with_columns(
-            pl.when(to_close).then(pl.lit(now)).otherwise(pl.col("valid_to")).alias("valid_to"),
-            pl
-            .when(to_close)
-            .then(pl.lit(False))
-            .otherwise(pl.col("is_current"))
-            .alias("is_current"),
+    predicate = _partition_predicate(df, partition_list) if partition_list else None
+
+    def _close(existing: pl.LazyFrame) -> pl.LazyFrame:
+        return (
+            existing.join(incoming.lazy(), on=keys, how="left")
+            .with_columns(
+                pl.when(to_close).then(pl.lit(now)).otherwise(pl.col("valid_to")).alias("valid_to"),
+                pl.when(to_close)
+                .then(pl.lit(False))
+                .otherwise(pl.col("is_current"))
+                .alias("is_current"),
+            )
+            .drop("__match")
         )
-        .drop("__match")
-    )
-    closed.sink_delta(
-        target,
-        mode="overwrite",
-        delta_write_options={
-            "schema_mode": "overwrite",
-            "configuration": _CDF_CONFIG,
-            "partition_by": partition_list,
-            "writer_properties": WriterProperties(),
-        },
-    )
+
+    if predicate is not None:
+        assert partition_list is not None
+        existing = pl.scan_delta(target)
+        for col in partition_list:
+            existing = existing.filter(pl.col(col).is_in(df[col].unique().to_list()))
+        _close(existing).sink_delta(
+            target,
+            mode="overwrite",
+            delta_write_options={
+                "predicate": predicate,
+                "partition_by": partition_list,
+                "writer_properties": WriterProperties(),
+            },
+        )
+    else:
+        _close(pl.scan_delta(target)).sink_delta(
+            target,
+            mode="overwrite",
+            delta_write_options={
+                "schema_mode": "overwrite",
+                "configuration": _CDF_CONFIG,
+                "partition_by": partition_list,
+                "writer_properties": WriterProperties(),
+            },
+        )
 
     # Step 2: Append new current versions, deduplicating on (key, valid_from)
     # for idempotency when the pipeline is re-run on the same batch. The existing
@@ -207,8 +229,7 @@ def _sink_scd2(
     dedup_cols = keys + ["valid_from"]
     new_df = cast(
         pl.DataFrame,
-        df
-        .lazy()
+        df.lazy()
         .join(pl.scan_delta(target).select(dedup_cols), on=dedup_cols, how="anti")
         .collect(engine="streaming"),
     )
@@ -249,8 +270,7 @@ def _sink_scd4(
         # distinct keys bounds the result to one row per incoming key.
         incoming_keys = df.select(keys).unique()
         _current = (
-            pl
-            .scan_delta(target)
+            pl.scan_delta(target)
             .join(incoming_keys.lazy(), on=keys, how="inner")
             .with_columns(pl.lit(now).alias("superseded_at"))
             .collect(engine="streaming")

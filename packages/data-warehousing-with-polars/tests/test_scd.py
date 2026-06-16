@@ -99,6 +99,39 @@ def test_scd2_partition_by(tmp_path):
     assert len(result) == 2
 
 
+def test_scd2_partitioned_update_closes_only_touched_partition(tmp_path):
+    """A partitioned update closes the old version (via the ``replaceWhere``-narrowed
+    close step) while leaving rows in untouched partitions intact."""
+    target = str(tmp_path / "scd2_partitioned")
+    _sink_scd2(
+        target,
+        pl.DataFrame({"id": [1, 2], "region": ["EU", "US"], "name": ["A", "B"]}).lazy(),
+        merge_on="id",
+        partition_by="region",
+    )
+    # Update only the EU row; the US partition must not be rewritten/closed.
+    _sink_scd2(
+        target,
+        pl.DataFrame({"id": [1], "region": ["EU"], "name": ["A V2"]}).lazy(),
+        merge_on="id",
+        partition_by="region",
+    )
+
+    result = pl.scan_delta(target).collect()
+
+    eu = result.filter(pl.col("region") == "EU")
+    assert len(eu) == 2  # original (closed) + new current
+    eu_current = eu.filter(pl.col("is_current"))
+    assert len(eu_current) == 1
+    assert eu_current["name"][0] == "A V2"
+    assert eu.filter(~pl.col("is_current"))["name"][0] == "A"
+
+    us = result.filter(pl.col("region") == "US")
+    assert len(us) == 1
+    assert us["is_current"].all()
+    assert us["name"][0] == "B"
+
+
 # ── _sink_scd4 ────────────────────────────────────────────────────────────────
 
 
@@ -253,7 +286,11 @@ def test_upsert_overwrite_partitioned_rewrites_only_touched_partitions(tmp_path)
 
     # Update only year 2021 (and insert a new id there).
     batch = pl.DataFrame(
-        {"id": [2, 3, 99], "year": pl.Series([2021, 2021, 2021], dtype=pl.Int32), "v": [9.0] * 3}
+        {
+            "id": [2, 3, 99],
+            "year": pl.Series([2021, 2021, 2021], dtype=pl.Int32),
+            "v": [9.0] * 3,
+        }
     )
     _upsert_overwrite(target, batch, ["id"], ["year"])
     after = _files_by_partition(target, "year")
