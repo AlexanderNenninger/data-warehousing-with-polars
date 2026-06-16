@@ -16,33 +16,37 @@ argument-hint: 'Optional: version number (e.g. 0.15.0)'
 
 Read `packages/polars-list-ext/Cargo.toml` and extract the `version` field from `[package]`.
 
-### 2. Ask the user for release details
+### 2. Check existing tags
 
-Tell the user the current version and present four options derived from it. For example, if the current base version is `0.14.0`:
+Run `git tag --list 'polars-list-ext-v*' | sort -V` to retrieve existing release tags.
+
+### 3. Ask the user for release details
+
+Tell the user the current version and the existing tags, then present four options derived from it. Mark any option whose tag already exists as `(already exists)`. For example, if the current base version is `0.14.0`:
 
 | Option | Description | Example tag |
 |--------|-------------|-------------|
 | **minor** | Bump minor, full release | `polars-list-ext-v0.15.0` |
 | **major** | Bump major, full release | `polars-list-ext-v1.0.0` |
-| **rc** | Bump minor, release candidate | `polars-list-ext-v0.15.0rc1` |
-| **dev** | Bump minor, dev pre-release | `polars-list-ext-v0.15.0.dev1` |
+| **rc** | Current version, release candidate | `polars-list-ext-v0.14.0rc1` |
+| **dev** | Current version, dev pre-release | `polars-list-ext-v0.14.0.dev1` |
 
 For rc/dev, also ask for the pre-release number (default: 1).
 
-Strip any existing pre-release suffix from the current version before computing the bump (e.g. `0.14.0-dev.1` → base `0.14.0`).
+Strip any existing pre-release suffix from the current version before computing tags (e.g. `0.14.0-dev.1` → base `0.14.0`). Apply the minor/major bump only for `minor` and `major` options.
 
-### 3. Update the version in `packages/polars-list-ext/Cargo.toml`
+### 4. Update the version in `packages/polars-list-ext/Cargo.toml`
 
 Edit the `version` field under `[package]` to match the new version (use PEP 440 / semver as appropriate).
 
-### 4. Commit the version bump
+### 5. Commit the version bump
 
 ```bash
 git add packages/polars-list-ext/Cargo.toml
 git commit -m "chore: bump polars-list-ext to <version>"
 ```
 
-### 5. Create and push the tag
+### 6. Create and push the tag
 
 ```bash
 git tag <tag>
@@ -51,7 +55,7 @@ git push origin HEAD <tag>
 
 This triggers the `publish-polars-list-ext.yml` workflow which builds wheels for all platforms and publishes to PyPI (if `PYPI_API_TOKEN` is set).
 
-### 6. Confirm
+### 7. Confirm
 
 Tell the user the tag that was pushed and link them to:
 `https://github.com/AlexanderNenninger/data-warehousing-with-polars/actions`
