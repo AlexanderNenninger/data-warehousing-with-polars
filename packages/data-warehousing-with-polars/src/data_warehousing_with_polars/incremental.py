@@ -85,13 +85,11 @@ def _save_cursors(store: str, cursors: dict[int, object]) -> None:
     """Overwrite the watermark table with one row per slot cursor."""
     slots = sorted(cursors)
     now = datetime.now(timezone.utc)
-    rows = pl.DataFrame(
-        {
-            "slot": slots,
-            "cursor_json": [json.dumps(cursors[s], default=str) for s in slots],
-            "saved_at": [now] * len(slots),
-        }
-    )
+    rows = pl.DataFrame({
+        "slot": slots,
+        "cursor_json": [json.dumps(cursors[s], default=str) for s in slots],
+        "saved_at": [now] * len(slots),
+    })
     write_deltalake(store, rows, mode="overwrite", schema_mode="overwrite")
 
 
@@ -254,9 +252,9 @@ class QuerySource:
     frame.
 
     .. note::
-        The frame is collected once to extract the cursor max — suitable for
-        HTTP/API sources where the full result fits in memory.  For large
-        file-based sources prefer implementing :class:`Source` directly.
+        Only the cursor maximum is materialised here; the frame itself stays
+        lazy and is streamed by the downstream sink.  For large file-based
+        sources prefer implementing :class:`Source` directly.
     """
 
     def __init__(
@@ -271,11 +269,14 @@ class QuerySource:
         lf = self._fn(since)
         if lf is None:
             return None
-        df = cast(pl.DataFrame, lf.collect())
-        cursor = df[self._cursor_on].max()
+        _cursor_df = cast(
+            pl.DataFrame,
+            lf.select(pl.col(self._cursor_on).max()).collect(engine="streaming"),
+        )
+        cursor = _cursor_df.item() if _cursor_df.height else None
         if cursor is None:
             return None
-        return Batch(frame=df.lazy(), cursor=cursor)
+        return Batch(frame=lf, cursor=cursor)
 
 
 class FrameSource:

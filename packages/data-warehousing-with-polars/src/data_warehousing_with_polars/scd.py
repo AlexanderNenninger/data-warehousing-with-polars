@@ -103,27 +103,29 @@ def _upsert_overwrite(
         for col in partition_list:
             existing = existing.filter(pl.col(col).is_in(df[col].unique().to_list()))
         keep = existing.join(df.lazy().select(join_cols), on=join_cols, how="anti")
-        merged = cast(pl.DataFrame, pl.concat([keep, df.lazy()], how="diagonal_relaxed").collect())
-        write_deltalake(
+        merged = pl.concat([keep, df.lazy()], how="diagonal_relaxed")
+        merged.sink_delta(
             target,
-            merged.to_arrow(),
             mode="overwrite",
-            predicate=predicate,
-            partition_by=partition_list,
-            writer_properties=WriterProperties(),
+            delta_write_options={
+                "predicate": predicate,
+                "partition_by": partition_list,
+                "writer_properties": WriterProperties(),
+            },
         )
         return
 
     keep = pl.scan_delta(target).join(df.lazy().select(join_cols), on=join_cols, how="anti")
-    merged = cast(pl.DataFrame, pl.concat([keep, df.lazy()], how="diagonal_relaxed").collect())
-    write_deltalake(
+    merged = pl.concat([keep, df.lazy()], how="diagonal_relaxed")
+    merged.sink_delta(
         target,
-        merged.to_arrow(),
         mode="overwrite",
-        schema_mode="overwrite",
-        configuration=_CDF_CONFIG,
-        partition_by=partition_list,
-        writer_properties=WriterProperties(),
+        delta_write_options={
+            "schema_mode": "overwrite",
+            "configuration": _CDF_CONFIG,
+            "partition_by": partition_list,
+            "writer_properties": WriterProperties(),
+        },
     )
 
 
@@ -173,36 +175,43 @@ def _sink_scd2(
     # rows that are currently open AND whose key appears in the batch are closed.
     incoming = df.select(keys).unique().with_columns(pl.lit(True).alias("__match"))
     to_close = pl.col("__match").fill_null(False) & pl.col("is_current")
-    closed = cast(
-        pl.DataFrame,
-        pl.scan_delta(target)
+    closed = (
+        pl
+        .scan_delta(target)
         .join(incoming.lazy(), on=keys, how="left")
         .with_columns(
             pl.when(to_close).then(pl.lit(now)).otherwise(pl.col("valid_to")).alias("valid_to"),
-            pl.when(to_close)
+            pl
+            .when(to_close)
             .then(pl.lit(False))
             .otherwise(pl.col("is_current"))
             .alias("is_current"),
         )
         .drop("__match")
-        .collect(),
     )
-    write_deltalake(
+    closed.sink_delta(
         target,
-        closed.to_arrow(),
         mode="overwrite",
-        schema_mode="overwrite",
-        configuration=_CDF_CONFIG,
-        partition_by=partition_list,
-        writer_properties=WriterProperties(),
+        delta_write_options={
+            "schema_mode": "overwrite",
+            "configuration": _CDF_CONFIG,
+            "partition_by": partition_list,
+            "writer_properties": WriterProperties(),
+        },
     )
 
     # Step 2: Append new current versions, deduplicating on (key, valid_from)
-    # for idempotency when the pipeline is re-run on the same batch.
+    # for idempotency when the pipeline is re-run on the same batch. The existing
+    # ``(key, valid_from)`` set is scanned out-of-core via the streaming engine; the
+    # anti-join result is bounded by the incoming batch, so it materialises safely.
     dedup_cols = keys + ["valid_from"]
-    _existing = pl.scan_delta(target).select(dedup_cols).collect()
-    existing = cast(pl.DataFrame, _existing)
-    new_df = df.join(existing, on=dedup_cols, how="anti")
+    new_df = cast(
+        pl.DataFrame,
+        df
+        .lazy()
+        .join(pl.scan_delta(target).select(dedup_cols), on=dedup_cols, how="anti")
+        .collect(engine="streaming"),
+    )
     if len(new_df) > 0:
         write_deltalake(
             target, new_df.to_arrow(), mode="append", writer_properties=WriterProperties()
@@ -235,13 +244,16 @@ def _sink_scd4(
     try:
         DeltaTable(target)  # existence probe; raises TableNotFoundError on first run
 
-        # Step 1: Archive current versions of affected records.
+        # Step 1: Archive current versions of affected records. The target is scanned
+        # out-of-core via the streaming engine; the inner join against the batch's
+        # distinct keys bounds the result to one row per incoming key.
         incoming_keys = df.select(keys).unique()
         _current = (
-            pl.scan_delta(target)
+            pl
+            .scan_delta(target)
             .join(incoming_keys.lazy(), on=keys, how="inner")
             .with_columns(pl.lit(now).alias("superseded_at"))
-            .collect()
+            .collect(engine="streaming")
         )
         current = cast(pl.DataFrame, _current)
         if len(current) > 0:
