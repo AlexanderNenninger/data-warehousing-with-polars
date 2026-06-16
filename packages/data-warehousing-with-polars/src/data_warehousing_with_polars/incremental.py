@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Literal, Protocol, cast, runtime_checkable
 
+import joblib
 import polars as pl
 from deltalake import DeltaTable, WriterProperties, write_deltalake
 from deltalake.exceptions import TableNotFoundError
@@ -85,13 +86,11 @@ def _save_cursors(store: str, cursors: dict[int, object]) -> None:
     """Overwrite the watermark table with one row per slot cursor."""
     slots = sorted(cursors)
     now = datetime.now(timezone.utc)
-    rows = pl.DataFrame(
-        {
-            "slot": slots,
-            "cursor_json": [json.dumps(cursors[s], default=str) for s in slots],
-            "saved_at": [now] * len(slots),
-        }
-    )
+    rows = pl.DataFrame({
+        "slot": slots,
+        "cursor_json": [json.dumps(cursors[s], default=str) for s in slots],
+        "saved_at": [now] * len(slots),
+    })
     write_deltalake(store, rows, mode="overwrite", schema_mode="overwrite")
 
 
@@ -404,6 +403,7 @@ def incremental(
     source: str | Source | list[str | Source],
     target: str,
     merge_on: str | list[str] | None = None,
+    fail_on_version_mismatch: bool = False,
     file_format: FileFormat = "parquet",
     watermark_store: str | None = None,
     partition_by: str | list[str] | None = None,
@@ -442,6 +442,12 @@ def incremental(
                          ``MERGE``); on a partitioned target only the affected
                          partitions are rewritten, so partitioned tables scale to
                          arbitrary size.
+        fail_on_version_mismatch: If ``True``, the pipeline will raise a
+            ``RuntimeError`` at run start when the stored pipeline hash
+            (from a previous run) differs from the current code hash. When
+            ``False`` (default) a warning is emitted instead. The pipeline
+            hash is computed with ``joblib.hash`` and persisted to
+            ``<watermark>/.pipeline_version`` on successful runs.
         file_format:     ``"parquet"`` (default) | ``"csv"`` | ``"ndjson"`` | ``"delta"``.
         watermark_store: Watermark table path. Defaults to ``target + "/.watermark"``.
         partition_by:    Partition column(s). Fixed at table creation. Also bounds
@@ -563,6 +569,7 @@ def incremental(
             source=source,
             target=target,
             merge_on=merge_on,
+            fail_on_version_mismatch=fail_on_version_mismatch,
             file_format=file_format,
             watermark_store=_watermark,
             partition_by=partition_by,
@@ -622,6 +629,7 @@ class IncrementalPipeline:
         staging: str | None = None,
         reader_kwargs: dict | None = None,
         concat_options: dict | None = None,
+        fail_on_version_mismatch: bool = False,
     ) -> None:
         """Validate config and set attributes.
 
@@ -648,6 +656,7 @@ class IncrementalPipeline:
         self.staging = staging
         self.reader_kwargs = reader_kwargs
         self.concat_options = concat_options
+        self.fail_on_version_mismatch = fail_on_version_mismatch
 
         # Normalize every source — directory, Delta table, or custom Source —
         # into a uniform list of Source adapters so all source types fan in.
@@ -668,6 +677,14 @@ class IncrementalPipeline:
         self.__wrapped__ = fn
         self.__name__ = getattr(fn, "__name__", repr(fn))
         self.__doc__ = fn.__doc__
+
+        # Pipeline version hash (joblib.hash covers function code and closure).
+        try:
+            self.pipeline_hash = joblib.hash(fn)
+        except Exception:
+            # Fallback: best-effort using function name if hashing fails.
+            self.pipeline_hash = getattr(fn, "__name__", repr(fn))
+        # honor passed parameter (already set above)
 
     def __call__(self, *lfs: pl.LazyFrame) -> pl.LazyFrame:
         """Call the wrapped transform function directly, bypassing the incremental machinery."""
@@ -702,6 +719,15 @@ class IncrementalPipeline:
             Identifiers of what was processed: new file paths for directory
             sources, ``["v{version}"]`` per Delta source, ``[cursor_repr]`` per
             custom :class:`Source`. ``[]`` when every source is up to date.
+
+        Notes:
+            This method performs a pipeline-version check before executing
+            writes. The computed pipeline hash is persisted under
+            ``<watermark>/.pipeline_version``; if a previous value exists and
+            differs from the current hash the pipeline will either log a
+            warning or raise ``RuntimeError`` depending on the
+            ``fail_on_version_mismatch`` setting supplied to
+            :func:`incremental`.
         """
         cursors = _load_cursors(self.watermark_store)
         batches: list[tuple[int, Batch]] = []
@@ -721,6 +747,23 @@ class IncrementalPipeline:
             for lbl in labels:
                 logger.info("  [dry_run] %s", lbl)
             return labels
+
+        # Check stored pipeline version and warn if it differs from current.
+        try:
+            stored = self._load_pipeline_version()
+            if stored is not None and stored != self.pipeline_hash:
+                msg = (
+                    f"Pipeline version changed (stored={stored} current={self.pipeline_hash}). "
+                    "This may make existing watermark/cursor incompatible."
+                )
+                if self.fail_on_version_mismatch:
+                    raise RuntimeError(msg)
+                logger.warning(msg)
+        except Exception as exc:
+            # If user asked to fail on mismatch, propagate RuntimeError; otherwise log debug.
+            if isinstance(exc, RuntimeError):
+                raise
+            logger.debug("Unable to read stored pipeline version.")
 
         frames = [b.frame for _, b in batches]
         result_lf = self.fn(*frames)
@@ -749,6 +792,12 @@ class IncrementalPipeline:
 
         new_cursors = {**cursors, **{i: b.cursor for i, b in batches}}
         _save_cursors(self.watermark_store, new_cursors)
+
+        # Persist pipeline version info alongside watermark.
+        try:
+            self._save_pipeline_version()
+        except Exception:
+            logger.exception("Failed to persist pipeline version.")
 
         if self.compact_every is not None:
             count = _load_run_count(self.watermark_store) + 1
@@ -791,3 +840,31 @@ class IncrementalPipeline:
             vacuum=vacuum,
             retention_hours=retention_hours,
         )
+
+    # ---------------------
+    # Pipeline version helpers
+    # ---------------------
+    def _pipeline_version_path(self) -> str:
+        return self.watermark_store.rstrip("/") + "/.pipeline_version"
+
+    def _save_pipeline_version(self) -> None:
+        # Write a tiny Delta table with a single row containing pipeline hash
+
+        path = self._pipeline_version_path()
+        df = pl.DataFrame({"pipeline_hash": [self.pipeline_hash]})
+        # Use write_deltalake and overwrite any previous value.
+        write_deltalake(path, df.to_arrow(), mode="overwrite", schema_mode="overwrite")
+
+    def _load_pipeline_version(self) -> str | None:
+        try:
+            dt = DeltaTable(self._pipeline_version_path())
+            tbl = dt.to_pyarrow_table()
+            df = pl.from_arrow(tbl)
+            # Ensure a DataFrame (pyarrow may produce a Series for single-column tables)
+            df = pl.DataFrame(df)
+            if len(df) == 0:
+                return None
+            vals = df["pipeline_hash"].to_list()
+            return str(vals[0])
+        except Exception:
+            return None

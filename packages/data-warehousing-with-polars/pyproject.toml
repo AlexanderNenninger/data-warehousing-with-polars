@@ -8,6 +8,7 @@ dependencies = [
     "deltalake>=0.22.3",
     "pyarrow>=19.0.0",
     "polars-list-ext",
+    "joblib>=1.2.0",
 ]
 
 [project.optional-dependencies]
