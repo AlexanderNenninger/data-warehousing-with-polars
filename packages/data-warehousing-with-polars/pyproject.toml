@@ -1,6 +1,6 @@
 [project]
 name = "data-warehousing-with-polars"
-version = "0.1.0.dev1"
+version = "0.1.0.dev2"
 description = "ACID data warehousing with Polars and Delta Lake"
 requires-python = ">=3.12"
 dependencies = [
