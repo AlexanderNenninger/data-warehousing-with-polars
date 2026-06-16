@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'dwp-v*'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -53,6 +54,12 @@ jobs:
         uses: actions/attest-build-provenance@v1
         with:
           subject-path: 'dist/*'
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
 
       - name: Publish to PyPI
         if: env.PUBLISH_TO_PYPI == 'true'
