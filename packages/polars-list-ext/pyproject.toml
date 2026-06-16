@@ -1,6 +1,6 @@
 [project]
 name = "polars-list-ext"
-authors = [{ name="Travis Hammond", email="dashdeckers@gmail.com" }]
+authors = [{ name = "Travis Hammond", email = "dashdeckers@gmail.com" }]
 description = "Utilities for working with List columns in Polars"
 readme = "README.md"
 dynamic = ["version"]
@@ -11,23 +11,15 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: PyPy",
     "Operating System :: OS Independent",
 ]
-requires-python = ">=3.10, <3.13"
-dependencies = [
-    "polars >= 1.23.0",
-]
+requires-python = ">=3.12"
+dependencies = ["polars >= 1.23.0"]
 
 [project.optional-dependencies]
-dev = [
-    "maturin >= 1.0, < 2.0",
-    "numpy >= 2.2.3",
-    "matplotlib >= 3.4.0",
-]
+dev = ["maturin >= 1.0, < 2.0", "numpy >= 2.2.3", "matplotlib >= 3.4.0"]
 
 [build-system]
 build-backend = "maturin"
-requires = [
-    "maturin >= 1.0, < 2.0",
-]
+requires = ["maturin >= 1.0, < 2.0"]
 
 [tool.maturin]
 module-name = "polars_list_ext._internal"
