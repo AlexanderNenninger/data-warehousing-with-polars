@@ -86,11 +86,13 @@ def _save_cursors(store: str, cursors: dict[int, object]) -> None:
     """Overwrite the watermark table with one row per slot cursor."""
     slots = sorted(cursors)
     now = datetime.now(timezone.utc)
-    rows = pl.DataFrame({
-        "slot": slots,
-        "cursor_json": [json.dumps(cursors[s], default=str) for s in slots],
-        "saved_at": [now] * len(slots),
-    })
+    rows = pl.DataFrame(
+        {
+            "slot": slots,
+            "cursor_json": [json.dumps(cursors[s], default=str) for s in slots],
+            "saved_at": [now] * len(slots),
+        }
+    )
     write_deltalake(store, rows, mode="overwrite", schema_mode="overwrite")
 
 
