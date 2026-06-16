@@ -25,7 +25,7 @@ jobs:
       - name: Install package and dependencies
         run: |
           python -m pip install uv
-          uv sync --package data-warehousing-with-polars --all-extras --group dev
+          uv sync --all-extras --group dev
 
       - name: Set up Quarto
         uses: quarto-dev/quarto-actions/setup@v2
