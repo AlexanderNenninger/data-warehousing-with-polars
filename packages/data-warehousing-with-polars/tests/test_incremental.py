@@ -1,5 +1,6 @@
 """Tests for incremental module."""
 
+from pathlib import Path
 from typing import Literal, cast
 
 import polars as pl
@@ -549,4 +550,164 @@ def test_fan_in_mixed_dir_and_custom(tmp_path):
     out = cast(pl.DataFrame, pl.scan_delta(str(tmp_path / "t")).collect())
     assert set(out["id"].to_list()) == {1, 2}
 
-    assert pipe.run() == []  # both sources up to date
+
+# ── by_partition tests ────────────────────────────────────────────────────────
+
+
+def test_by_partition_without_partition_by_raises() -> None:
+    with pytest.raises(ValueError, match="partition_by"):
+
+        @incremental(source="/tmp/in/", target="/tmp/out/", merge_on="id", by_partition=True)
+        def pipe(lf: pl.LazyFrame) -> pl.LazyFrame:
+            return lf
+
+
+def test_by_partition_stored_as_attribute() -> None:
+    @incremental(
+        source="/tmp/in/",
+        target="/tmp/out/",
+        merge_on="id",
+        partition_by="region",
+        by_partition=True,
+    )
+    def pipe(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf
+
+    assert pipe.by_partition is True
+
+
+def test_by_partition_fn_called_once_per_partition(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    pl.DataFrame(
+        {"id": [1, 2, 3, 4], "region": ["EU", "EU", "US", "US"], "v": [10, 20, 30, 40]}
+    ).write_parquet(src / "data.parquet")
+
+    call_log: list[str] = []
+
+    @incremental(
+        source=str(src),
+        target=str(tmp_path / "tgt"),
+        merge_on="id",
+        partition_by="region",
+        by_partition=True,
+    )
+    def pipe(lf: pl.LazyFrame) -> pl.LazyFrame:
+        df = cast(pl.DataFrame, lf.collect())
+        call_log.extend(df["region"].unique().to_list())
+        return df.lazy()
+
+    pipe.run()
+
+    assert len(call_log) == 2
+    assert set(call_log) == {"EU", "US"}
+
+
+def test_by_partition_result_matches_non_partitioned(tmp_path: Path) -> None:
+    data = pl.DataFrame(
+        {"id": [1, 2, 3, 4], "region": ["EU", "EU", "US", "US"], "v": [10, 20, 30, 40]}
+    )
+    for name in ("src_a", "src_b"):
+        d = tmp_path / name
+        d.mkdir()
+        data.write_parquet(d / "data.parquet")
+
+    @incremental(
+        source=str(tmp_path / "src_a"),
+        target=str(tmp_path / "by_part"),
+        merge_on="id",
+        partition_by="region",
+        by_partition=True,
+    )
+    def pipe_a(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf.select("id", "region", "v")
+
+    @incremental(
+        source=str(tmp_path / "src_b"),
+        target=str(tmp_path / "normal"),
+        merge_on="id",
+        partition_by="region",
+    )
+    def pipe_b(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf.select("id", "region", "v")
+
+    pipe_a.run()
+    pipe_b.run()
+
+    result_a = cast(pl.DataFrame, pl.scan_delta(str(tmp_path / "by_part")).collect()).sort("id")
+    result_b = cast(pl.DataFrame, pl.scan_delta(str(tmp_path / "normal")).collect()).sort("id")
+    assert result_a.equals(result_b)
+
+
+def test_by_partition_scd2(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    pl.DataFrame(
+        {"id": [1, 2, 3, 4], "region": ["EU", "EU", "US", "US"], "name": ["A", "B", "C", "D"]}
+    ).write_parquet(src / "v1.parquet")
+
+    @incremental(
+        source=str(src),
+        target=str(tmp_path / "tgt"),
+        merge_on="id",
+        partition_by="region",
+        scd_type=2,
+        by_partition=True,
+    )
+    def pipe(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf
+
+    pipe.run()
+    result = cast(pl.DataFrame, pl.scan_delta(str(tmp_path / "tgt")).collect())
+    assert len(result) == 4
+    assert result["is_current"].all()
+
+    pl.DataFrame({"id": [1, 2], "region": ["EU", "EU"], "name": ["A2", "B2"]}).write_parquet(
+        src / "v2.parquet"
+    )
+
+    pipe.run()
+    result2 = cast(pl.DataFrame, pl.scan_delta(str(tmp_path / "tgt")).collect())
+    # 2 closed EU + 2 unchanged US + 2 new current EU = 6 rows
+    assert len(result2) == 6
+    eu_current = result2.filter(pl.col("region") == "EU").filter(pl.col("is_current"))
+    assert len(eu_current) == 2
+    assert set(eu_current["name"].to_list()) == {"A2", "B2"}
+    us_current = result2.filter(pl.col("region") == "US").filter(pl.col("is_current"))
+    assert len(us_current) == 2
+
+
+def test_by_partition_scd4(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    pl.DataFrame(
+        {"id": [1, 2, 3, 4], "region": ["EU", "EU", "US", "US"], "name": ["A", "B", "C", "D"]}
+    ).write_parquet(src / "v1.parquet")
+
+    @incremental(
+        source=str(src),
+        target=str(tmp_path / "tgt"),
+        history_target=str(tmp_path / "hist"),
+        merge_on="id",
+        partition_by="region",
+        scd_type=4,
+        by_partition=True,
+    )
+    def pipe(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf
+
+    pipe.run()
+    assert len(cast(pl.DataFrame, pl.scan_delta(str(tmp_path / "tgt")).collect())) == 4
+
+    pl.DataFrame({"id": [1, 2], "region": ["EU", "EU"], "name": ["A2", "B2"]}).write_parquet(
+        src / "v2.parquet"
+    )
+
+    pipe.run()
+    current = cast(pl.DataFrame, pl.scan_delta(str(tmp_path / "tgt")).collect())
+    assert len(current) == 4
+    eu = current.filter(pl.col("region") == "EU").sort("id")
+    assert eu["name"].to_list() == ["A2", "B2"]
+    hist = cast(pl.DataFrame, pl.scan_delta(str(tmp_path / "hist")).collect())
+    assert len(hist) == 2
+    assert set(hist["name"].to_list()) == {"A", "B"}

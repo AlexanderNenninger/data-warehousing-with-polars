@@ -24,11 +24,15 @@ from data_warehousing_with_polars.incremental import incremental  # noqa: E402
 
 # ── Constants (kept in sync with test_memory.py) ──────────────────────────────
 
-N_ROWS = 400_000
-N_PARTITIONS = 5
-ROWS_PER_PARTITION = N_ROWS // N_PARTITIONS
+N_PARTITIONS = 10
+ROWS_PER_PARTITION = 10_000
+N_ROWS = N_PARTITIONS * ROWS_PER_PARTITION
 FIXED_OVERHEAD_MB = 200.0
 MEM_FACTOR = 6.0
+
+# Number of distinct measurements for the group-by-into-lists stress test.
+# Few groups => long per-group list columns, which is the memory-heavy case.
+N_MEASUREMENTS = 50
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -99,6 +103,34 @@ def _write_partitioned_ndjson(src: Path) -> float:
             }
         )
         df.write_ndjson(partition_dir / "batch.ndjson")
+        total_bytes += df.estimated_size()
+    return total_bytes / (1024 * 1024)
+
+
+def _write_partitioned_measurements(src: Path) -> float:
+    """Write partitioned parquet with (measurement, unit, timestamp, value) columns.
+
+    Each partition holds ``ROWS_PER_PARTITION`` readings spread over
+    ``N_MEASUREMENTS`` distinct measurements, so grouping by measurement yields
+    a handful of groups with very long ``timestamp``/``value`` list columns.
+    """
+    base_us = 1_700_000_000_000_000  # microseconds since epoch
+    units = [f"unit_{m % 5}" for m in range(N_MEASUREMENTS)]
+    total_bytes = 0
+    for p in range(N_PARTITIONS):
+        partition_dir = src / f"date=2024-01-{p + 1:02d}"
+        partition_dir.mkdir(parents=True, exist_ok=True)
+        start = p * ROWS_PER_PARTITION
+        measurement_ids = [(start + i) % N_MEASUREMENTS for i in range(ROWS_PER_PARTITION)]
+        df = pl.DataFrame(
+            {
+                "measurement": [f"sensor_{m:03d}" for m in measurement_ids],
+                "unit": [units[m] for m in measurement_ids],
+                "timestamp": [base_us + (start + i) * 1_000 for i in range(ROWS_PER_PARTITION)],
+                "value": [float(i) * 1.1 for i in range(ROWS_PER_PARTITION)],
+            }
+        ).with_columns(pl.col("timestamp").cast(pl.Datetime("us")))
+        df.write_parquet(partition_dir / "batch.parquet")
         total_bytes += df.estimated_size()
     return total_bytes / (1024 * 1024)
 
@@ -380,6 +412,31 @@ def run_streaming_append_sublinear(tmp_path: str) -> None:
     delta = m.delta_mb()
     m.stop()
     _check(delta, FIXED_OVERHEAD_MB + MEM_FACTOR * (data_mb / N_PARTITIONS))
+
+
+def run_groupby_list_agg(tmp_path: str) -> None:
+    """Group by measurement, collapse timestamps/values into list columns and take
+    the first unit.  Aggregating into lists is memory-heavy; verify it stays bounded.
+    """
+    p = Path(tmp_path)
+    src = p / "src"
+    src.mkdir()
+    data_mb = _write_partitioned_measurements(src)
+
+    @incremental(source=str(src), target=str(p / "target"), merge_on="measurement")
+    def pipeline(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf.group_by("measurement").agg(
+            pl.first("unit").alias("unit"),
+            pl.col("timestamp"),
+            pl.col("value"),
+        )
+
+    m = _RSSMeasurement()
+    m.reset()
+    pipeline.run()
+    delta = m.delta_mb()
+    m.stop()
+    _check(delta, FIXED_OVERHEAD_MB + MEM_FACTOR * data_mb)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

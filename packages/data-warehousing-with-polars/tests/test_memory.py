@@ -82,6 +82,13 @@ def test_memory_compact_every(tmp_path: Path) -> None:
     _run("compact_every", tmp_path)
 
 
+def test_memory_groupby_list_agg(tmp_path: Path) -> None:
+    """Group-by-into-lists aggregation (timestamps/values as lists, first unit)
+    on a large dataset stays within memory bound.
+    """
+    _run("groupby_list_agg", tmp_path)
+
+
 def test_memory_streaming_append_sublinear(tmp_path: Path) -> None:
     """sink_delta streams partition-by-partition; peak RSS is proportional to one
     partition, not the full dataset.  Bound: FIXED_OVERHEAD_MB + MEM_FACTOR *
