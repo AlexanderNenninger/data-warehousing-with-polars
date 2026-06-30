@@ -126,6 +126,13 @@ def _scan_files(
     return pl.concat(frames, **cc)
 
 
+def _partition_list(partition_by: str | list[str] | None) -> list[str] | None:
+    """Normalise the partition_by argument to a list or None."""
+    if partition_by is None:
+        return None
+    return [partition_by] if isinstance(partition_by, str) else list(partition_by)
+
+
 def _read_delta_source(
     source: str,
     from_version: int | None,
@@ -416,6 +423,7 @@ def incremental(
     staging: str | None = None,
     reader_kwargs: dict | None = None,
     concat_options: dict | None = None,
+    by_partition: bool = False,
 ) -> Callable:
     """Wrap a ``LazyFrame → LazyFrame`` function as an :class:`IncrementalPipeline`.
 
@@ -582,6 +590,7 @@ def incremental(
             staging=staging,
             reader_kwargs=reader_kwargs,
             concat_options=concat_options,
+            by_partition=by_partition,
         )
 
     return decorator
@@ -631,6 +640,7 @@ class IncrementalPipeline:
         staging: str | None = None,
         reader_kwargs: dict | None = None,
         concat_options: dict | None = None,
+        by_partition: bool = False,
         fail_on_version_mismatch: bool = False,
     ) -> None:
         """Validate config and set attributes.
@@ -638,11 +648,17 @@ class IncrementalPipeline:
         Raises:
             ValueError: If ``scd_type=4`` and ``history_target`` is not set.
             ValueError: If ``merge_on`` is an empty list.
+            ValueError: If ``by_partition=True`` and ``partition_by`` is not set.
+            ValueError: If ``by_partition=True`` and ``compute_context`` is set.
         """
         if isinstance(merge_on, list) and len(merge_on) == 0:
             raise ValueError("merge_on must not be an empty list")
         if scd_type == 4 and history_target is None:
             raise ValueError("history_target is required when scd_type=4")
+        if by_partition and not partition_by:
+            raise ValueError("by_partition=True requires partition_by to be set")
+        if by_partition and compute_context is not None:
+            raise ValueError("by_partition=True is not supported with compute_context")
 
         self.fn = fn
         self.source = source
@@ -658,6 +674,7 @@ class IncrementalPipeline:
         self.staging = staging
         self.reader_kwargs = reader_kwargs
         self.concat_options = concat_options
+        self.by_partition = by_partition
         self.fail_on_version_mismatch = fail_on_version_mismatch
 
         # Normalize every source — directory, Delta table, or custom Source —
@@ -767,30 +784,12 @@ class IncrementalPipeline:
                 raise
             logger.debug("Unable to read stored pipeline version.")
 
-        frames = [b.frame for _, b in batches]
-        result_lf = self.fn(*frames)
-
-        if self.compute_context is not None:
-            from .cloud import _sink_target_remote  # noqa: PLC0415
-
-            _sink_target_remote(
-                self.target,
-                result_lf,
-                self.merge_on,
-                self.compute_context,
-                self.partition_by,
-            )
-        elif self.scd_type == 2:
-            assert self.merge_on is not None, "merge_on is required for scd_type=2"
-            _sink_scd2(self.target, result_lf, self.merge_on, self.partition_by)
-        elif self.scd_type == 4:
-            assert self.merge_on is not None, "merge_on is required for scd_type=4"
-            assert self.history_target is not None
-            _sink_scd4(
-                self.target, self.history_target, result_lf, self.merge_on, self.partition_by
-            )
+        if self.by_partition:
+            self._run_by_partition(batches, cursors)
         else:
-            _sink_target(self.target, result_lf, self.merge_on, self.partition_by)
+            frames = [b.frame for _, b in batches]
+            result_lf = self.fn(*frames)
+            self._dispatch_sink(result_lf)
 
         new_cursors = {**cursors, **{i: b.cursor for i, b in batches}}
         _save_cursors(self.watermark_store, new_cursors)
@@ -809,6 +808,80 @@ class IncrementalPipeline:
 
         logger.info("Processed %d source(s).", len(batches))
         return labels
+
+    def _dispatch_sink(self, lf: pl.LazyFrame) -> None:
+        """Write *lf* to the target using the appropriate sink strategy."""
+        if self.compute_context is not None:
+            from .cloud import _sink_target_remote  # noqa: PLC0415
+
+            _sink_target_remote(
+                self.target,
+                lf,
+                self.merge_on,
+                self.compute_context,
+                self.partition_by,
+            )
+        elif self.scd_type == 2:
+            assert self.merge_on is not None, "merge_on is required for scd_type=2"
+            _sink_scd2(self.target, lf, self.merge_on, self.partition_by)
+        elif self.scd_type == 4:
+            assert self.merge_on is not None, "merge_on is required for scd_type=4"
+            assert self.history_target is not None
+            _sink_scd4(self.target, self.history_target, lf, self.merge_on, self.partition_by)
+        else:
+            _sink_target(self.target, lf, self.merge_on, self.partition_by)
+
+    def _run_by_partition(
+        self,
+        batches: list[tuple[int, Batch]],
+        cursors: dict[int, object],
+    ) -> None:
+        """Call fn + sink once per distinct partition combination in the batch."""
+        part_cols = _partition_list(self.partition_by)
+        assert part_cols is not None  # guaranteed by __init__ validation
+
+        # Build a resolved frame for every source slot that can contribute to fn's
+        # argument list.  Active CDF sources whose cursor is not None are single-use
+        # RecordBatchReader streams — collect them once.  Re-scannable sources
+        # (scan_delta on first run, scan_parquet concat) stay lazy so partition
+        # pruning applies per iteration.  Idle _DeltaCdfSource slots get a 0-row
+        # lazy frame so fn receives a consistent argument count across partitions.
+        active_slots = {slot_i for slot_i, _ in batches}
+        resolved: dict[int, pl.LazyFrame | pl.DataFrame] = {}
+        for i, src in enumerate(self._sources):
+            if i in active_slots:
+                batch = next(b for slot, b in batches if slot == i)
+                single_use = isinstance(src, _DeltaCdfSource) and cursors.get(i) is not None
+                resolved[i] = (
+                    cast(pl.DataFrame, batch.frame.collect()) if single_use else batch.frame
+                )
+            elif isinstance(src, _DeltaCdfSource):
+                # Idle Delta source: schema is available from the transaction log.
+                resolved[i] = pl.scan_delta(src._source_path).head(0)
+            # Other idle source types: omitted (schema unknowable without reading data).
+
+        def _as_lazy(f: pl.LazyFrame | pl.DataFrame) -> pl.LazyFrame:
+            return f if isinstance(f, pl.LazyFrame) else f.lazy()
+
+        # Enumerate distinct partition combos from ACTIVE sources only.
+        active_frames = [resolved[i] for i in sorted(active_slots) if i in resolved]
+        part_frames = [_as_lazy(f).select(part_cols).unique() for f in active_frames]
+        combos = pl.concat(part_frames).unique().sort(part_cols).collect().to_dicts()
+
+        for combo in combos:
+            if any(v is None for v in combo.values()):
+                raise ValueError(
+                    f"by_partition=True does not support null partition values; got {combo!r}"
+                )
+
+        for combo in combos:
+            filt = pl.all_horizontal([pl.col(c) == v for c, v in combo.items()])
+            partition_frames = [
+                _as_lazy(resolved[i]).filter(filt)
+                for i in range(len(self._sources))
+                if i in resolved
+            ]
+            self._dispatch_sink(self.fn(*partition_frames))
 
     def reset(self) -> None:
         """Delete all watermark rows so the next ``run()`` reprocesses all files."""
