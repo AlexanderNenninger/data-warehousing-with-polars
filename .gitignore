@@ -20,3 +20,6 @@ great-docs/
 .great-docs/
 .env
 Cargo.lock
+
+# Quarto extensions
+_extensions/

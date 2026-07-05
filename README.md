@@ -379,7 +379,8 @@ poe ext_build    # rebuild the Rust plugin (maturin develop --release)
 # Demo pipelines (require AWS credentials in .env)
 poe monatszahlen   # munich_monatszahlen.py
 poe cycling        # munich_cycling.py
-poe pipelines      # both in sequence
+poe solar          # munich_solar.py
+poe pipelines      # all three in sequence
 
 # Docs
 poe docs           # great-docs build

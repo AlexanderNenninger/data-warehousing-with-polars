@@ -69,7 +69,8 @@ ext_build = "maturin develop --release --manifest-path packages/polars-list-ext/
 # ── Pipelines ──────────────────────────────────────────────────────────────────
 monatszahlen = "python app/munich_monatszahlen.py"
 cycling = "python app/munich_cycling.py"
-pipelines.sequence = ["monatszahlen", "cycling"]
+solar = "python app/munich_solar.py"
+pipelines.sequence = ["monatszahlen", "cycling", "solar"]
 
 # ── Docs ───────────────────────────────────────────────────────────────────────
 docs = "great-docs build"
