@@ -7,8 +7,11 @@ Coordinates file listing, watermark tracking, transform dispatch, and compaction
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,7 +19,7 @@ from typing import Callable, Literal, Protocol, cast, runtime_checkable
 
 import joblib
 import polars as pl
-from deltalake import DeltaTable, WriterProperties, write_deltalake
+from deltalake import CommitProperties, DeltaTable, WriterProperties, write_deltalake
 from deltalake.exceptions import TableNotFoundError
 
 from .maintenance import _load_run_count, _save_run_count, maintain
@@ -161,8 +164,20 @@ def _sink_target(
     lf: pl.LazyFrame,
     merge_on: str | list[str] | None,
     partition_by: str | list[str] | None = None,
+    commit_properties: CommitProperties | None = None,
+    creation_lock: threading.Lock | None = None,
 ) -> None:
-    """Write *lf* to *target*: append when ``merge_on`` is ``None``, upsert otherwise."""
+    """Write *lf* to *target*: append when ``merge_on`` is ``None``, upsert otherwise.
+
+    *creation_lock*, when given, serialises the "does the table exist yet, and if not
+    create it" decision across concurrent callers (see
+    :meth:`IncrementalPipeline._run_by_partition`). Without it, two threads racing to
+    create a brand-new table would both attempt the
+    schema/protocol-establishing write and one would fail with a commit conflict — unlike
+    ordinary data commits, table creation is not something delta-rs's optimistic-concurrency
+    retry can safely resolve on its own. Once the table exists, concurrent writes proceed
+    unlocked, relying on delta-rs's normal conditional-PUT-based conflict resolution.
+    """
     keys = [merge_on] if isinstance(merge_on, str) else (list(merge_on) if merge_on else [])
     partition_list = (
         [partition_by]
@@ -170,15 +185,16 @@ def _sink_target(
         else (list(partition_by) if partition_by else None)
     )
 
-    first_write = False
-    try:
-        DeltaTable(target)
-    except TableNotFoundError:
-        first_write = True
+    guard = creation_lock or contextlib.nullcontext()
+    with guard:
+        first_write = False
+        try:
+            DeltaTable(target)
+        except TableNotFoundError:
+            first_write = True
 
-    if not keys:
         if first_write:
-            _df = cast(pl.DataFrame, lf.collect())
+            _df = cast(pl.DataFrame, lf.collect() if not keys else lf.collect(engine="streaming"))
             write_deltalake(
                 target,
                 _df.to_arrow(),
@@ -186,30 +202,26 @@ def _sink_target(
                 configuration=_CDF_CONFIG,
                 partition_by=partition_list,
                 writer_properties=WriterProperties(),
+                commit_properties=commit_properties,
             )
-        else:
-            # Streaming append: data flows chunk-by-chunk without full materialisation.
-            lf.sink_delta(target, mode="append")
+            return
+
+    # Table already exists (created here, or by a concurrent sibling while we waited on
+    # the lock) — safe to proceed unlocked from here on.
+    if not keys:
+        # Streaming append: data flows chunk-by-chunk without full materialisation.
+        lf.sink_delta(
+            target, mode="append", delta_write_options={"commit_properties": commit_properties}
+        )
         return
 
     _df = cast(pl.DataFrame, lf.collect(engine="streaming"))
-
-    if first_write:
-        write_deltalake(
-            target,
-            _df.to_arrow(),
-            mode="overwrite",
-            configuration=_CDF_CONFIG,
-            partition_by=partition_list,
-            writer_properties=WriterProperties(),
-        )
-        return
 
     # Upsert via full-table rewrite (anti-join + overwrite) rather than Delta MERGE,
     # which delta-rs 1.6 executes unreliably on S3 targets at scale. Match on the same
     # columns the MERGE predicate used: merge keys plus any partition columns.
     join_cols = keys + (partition_list or [])
-    _upsert_overwrite(target, _df, join_cols, partition_list)
+    _upsert_overwrite(target, _df, join_cols, partition_list, commit_properties=commit_properties)
 
 
 # ── Source protocol and built-in implementations ──────────────────────────────
@@ -424,6 +436,7 @@ def incremental(
     reader_kwargs: dict | None = None,
     concat_options: dict | None = None,
     by_partition: bool = False,
+    by_partition_workers: int = 4,
 ) -> Callable:
     """Wrap a ``LazyFrame → LazyFrame`` function as an :class:`IncrementalPipeline`.
 
@@ -472,6 +485,17 @@ def incremental(
         staging:         Unused. Kept for backwards compatibility.
         reader_kwargs:   Forwarded to the file scanner (``pl.scan_parquet`` etc.).
         concat_options:  Forwarded to ``pl.concat`` when combining files.
+        by_partition_workers: Number of partitions processed concurrently when
+                         ``by_partition=True`` (default ``4``); ignored otherwise. Each
+                         worker independently loads, transforms, and writes one partition,
+                         so this bounds how many partitions' worth of data are held in
+                         memory at once — the backpressure knob for large fan-outs. Safe
+                         by construction: on S3-compatible targets, delta-rs's ETag-based
+                         conditional PUT (the ``object_store`` default) already serialises
+                         concurrent commits from multiple threads to the same table; on
+                         local filesystems, atomic exclusive commit-file creation does the
+                         same with no configuration needed either way. The pipeline scales
+                         delta-rs's commit-retry budget to match this worker count.
 
     Examples:
         Basic upsert — process new Parquet files and merge on ``id``::
@@ -591,6 +615,7 @@ def incremental(
             reader_kwargs=reader_kwargs,
             concat_options=concat_options,
             by_partition=by_partition,
+            by_partition_workers=by_partition_workers,
         )
 
     return decorator
@@ -641,6 +666,7 @@ class IncrementalPipeline:
         reader_kwargs: dict | None = None,
         concat_options: dict | None = None,
         by_partition: bool = False,
+        by_partition_workers: int = 4,
         fail_on_version_mismatch: bool = False,
     ) -> None:
         """Validate config and set attributes.
@@ -675,6 +701,7 @@ class IncrementalPipeline:
         self.reader_kwargs = reader_kwargs
         self.concat_options = concat_options
         self.by_partition = by_partition
+        self.by_partition_workers = by_partition_workers
         self.fail_on_version_mismatch = fail_on_version_mismatch
 
         # Normalize every source — directory, Delta table, or custom Source —
@@ -809,7 +836,12 @@ class IncrementalPipeline:
         logger.info("Processed %d source(s).", len(batches))
         return labels
 
-    def _dispatch_sink(self, lf: pl.LazyFrame) -> None:
+    def _dispatch_sink(
+        self,
+        lf: pl.LazyFrame,
+        commit_properties: CommitProperties | None = None,
+        creation_lock: threading.Lock | None = None,
+    ) -> None:
         """Write *lf* to the target using the appropriate sink strategy."""
         if self.compute_context is not None:
             from .cloud import _sink_target_remote  # noqa: PLC0415
@@ -823,20 +855,75 @@ class IncrementalPipeline:
             )
         elif self.scd_type == 2:
             assert self.merge_on is not None, "merge_on is required for scd_type=2"
-            _sink_scd2(self.target, lf, self.merge_on, self.partition_by)
+            _sink_scd2(
+                self.target,
+                lf,
+                self.merge_on,
+                self.partition_by,
+                commit_properties=commit_properties,
+                creation_lock=creation_lock,
+            )
         elif self.scd_type == 4:
             assert self.merge_on is not None, "merge_on is required for scd_type=4"
             assert self.history_target is not None
-            _sink_scd4(self.target, self.history_target, lf, self.merge_on, self.partition_by)
+            _sink_scd4(
+                self.target,
+                self.history_target,
+                lf,
+                self.merge_on,
+                self.partition_by,
+                commit_properties=commit_properties,
+                creation_lock=creation_lock,
+            )
         else:
-            _sink_target(self.target, lf, self.merge_on, self.partition_by)
+            _sink_target(
+                self.target,
+                lf,
+                self.merge_on,
+                self.partition_by,
+                commit_properties=commit_properties,
+                creation_lock=creation_lock,
+            )
+
+    def _process_partition_combo(
+        self,
+        combo: dict[str, object],
+        resolved: dict[int, pl.LazyFrame | pl.DataFrame],
+        commit_properties: CommitProperties | None,
+        creation_lock: threading.Lock | None,
+    ) -> None:
+        """Filter every resolved source frame down to *combo*, run ``fn``, and sink the result."""
+
+        def _as_lazy(f: pl.LazyFrame | pl.DataFrame) -> pl.LazyFrame:
+            return f if isinstance(f, pl.LazyFrame) else f.lazy()
+
+        filt = pl.all_horizontal([pl.col(c) == v for c, v in combo.items()])
+        partition_frames = [
+            _as_lazy(resolved[i]).filter(filt) for i in range(len(self._sources)) if i in resolved
+        ]
+        self._dispatch_sink(
+            self.fn(*partition_frames),
+            commit_properties=commit_properties,
+            creation_lock=creation_lock,
+        )
 
     def _run_by_partition(
         self,
         batches: list[tuple[int, Batch]],
         cursors: dict[int, object],
     ) -> None:
-        """Call fn + sink once per distinct partition combination in the batch."""
+        """Call fn + sink once per distinct partition combination in the batch.
+
+        Partitions are fully independent — different filters, transforms, and Delta
+        commits — so each combo runs in its own worker thread, up to
+        ``by_partition_workers`` at a time (the memory-backpressure bound: only that
+        many partitions' worth of data is ever materialised concurrently). Concurrent
+        commits landing in the same Delta table are made safe by delta-rs itself:
+        S3-compatible stores default to ETag-based conditional PUT and local
+        filesystems use atomic exclusive file creation, both already serialising
+        commits without any locking provider. ``max_commit_retries`` is scaled up to
+        cover the extra optimistic-concurrency retries this contention causes.
+        """
         part_cols = _partition_list(self.partition_by)
         assert part_cols is not None  # guaranteed by __init__ validation
 
@@ -874,14 +961,25 @@ class IncrementalPipeline:
                     f"by_partition=True does not support null partition values; got {combo!r}"
                 )
 
-        for combo in combos:
-            filt = pl.all_horizontal([pl.col(c) == v for c, v in combo.items()])
-            partition_frames = [
-                _as_lazy(resolved[i]).filter(filt)
-                for i in range(len(self._sources))
-                if i in resolved
+        commit_properties = CommitProperties(
+            max_commit_retries=max(15, self.by_partition_workers * 3)
+        )
+        # Serialises only the "table doesn't exist yet, create it" decision (for the
+        # target and, for scd_type=4, the history table) across worker threads — see
+        # the docstring on `_sink_target` for why table creation itself can't rely on
+        # delta-rs's normal concurrent-commit retry.
+        creation_lock = threading.Lock()
+
+        with ThreadPoolExecutor(max_workers=self.by_partition_workers) as executor:
+            futures = [
+                executor.submit(
+                    self._process_partition_combo, combo, resolved, commit_properties, creation_lock
+                )
+                for combo in combos
             ]
-            self._dispatch_sink(self.fn(*partition_frames))
+            errors = [exc for f in as_completed(futures) if (exc := f.exception()) is not None]
+        if errors:
+            raise errors[0]
 
     def reset(self) -> None:
         """Delete all watermark rows so the next ``run()`` reprocesses all files."""

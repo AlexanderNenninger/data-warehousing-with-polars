@@ -711,3 +711,109 @@ def test_by_partition_scd4(tmp_path: Path) -> None:
     hist = cast(pl.DataFrame, pl.scan_delta(str(tmp_path / "hist")).collect())
     assert len(hist) == 2
     assert set(hist["name"].to_list()) == {"A", "B"}
+
+
+# ── by_partition threading tests ────────────────────────────────────────────────
+
+
+def test_by_partition_workers_process_partitions_concurrently(tmp_path: Path) -> None:
+    """With by_partition_workers > 1, independent partitions overlap in time."""
+    import threading
+    import time
+
+    src = tmp_path / "src"
+    src.mkdir()
+    regions = ["A", "B", "C", "D", "E", "F"]
+    pl.DataFrame(
+        {
+            "id": list(range(len(regions))),
+            "region": regions,
+            "v": list(range(len(regions))),
+        }
+    ).write_parquet(src / "data.parquet")
+
+    intervals: list[tuple[float, float]] = []
+    lock = threading.Lock()
+
+    @incremental(
+        source=str(src),
+        target=str(tmp_path / "tgt"),
+        merge_on="id",
+        partition_by="region",
+        by_partition=True,
+        by_partition_workers=3,
+    )
+    def pipe(lf: pl.LazyFrame) -> pl.LazyFrame:
+        start = time.monotonic()
+        time.sleep(0.1)
+        end = time.monotonic()
+        with lock:
+            intervals.append((start, end))
+        return lf
+
+    pipe.run()
+
+    assert len(intervals) == len(regions)
+    # Prove genuine overlap: at least one pair of calls was in flight at the same time.
+    overlap = any(
+        a_start < b_end and b_start < a_end
+        for i, (a_start, a_end) in enumerate(intervals)
+        for b_start, b_end in intervals[i + 1 :]
+    )
+    assert overlap, "expected at least two partitions to be processed concurrently"
+
+    result = cast(pl.DataFrame, pl.scan_delta(str(tmp_path / "tgt")).collect()).sort("id")
+    assert result["region"].to_list() == regions
+
+
+def test_by_partition_workers_one_is_sequential(tmp_path: Path) -> None:
+    """by_partition_workers=1 still produces the correct result, one partition at a time."""
+    src = tmp_path / "src"
+    src.mkdir()
+    pl.DataFrame(
+        {"id": [1, 2, 3, 4], "region": ["EU", "EU", "US", "US"], "v": [10, 20, 30, 40]}
+    ).write_parquet(src / "data.parquet")
+
+    @incremental(
+        source=str(src),
+        target=str(tmp_path / "tgt"),
+        merge_on="id",
+        partition_by="region",
+        by_partition=True,
+        by_partition_workers=1,
+    )
+    def pipe(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf
+
+    pipe.run()
+    result = cast(pl.DataFrame, pl.scan_delta(str(tmp_path / "tgt")).collect()).sort("id")
+    assert result["v"].to_list() == [10, 20, 30, 40]
+
+
+def test_by_partition_worker_error_propagates_and_watermark_unchanged(tmp_path: Path) -> None:
+    """An exception in one partition's fn aborts the run and leaves the watermark untouched."""
+    src = tmp_path / "src"
+    src.mkdir()
+    pl.DataFrame(
+        {"id": [1, 2, 3, 4], "region": ["EU", "EU", "US", "US"], "v": [10, 20, 30, 40]}
+    ).write_parquet(src / "data.parquet")
+
+    @incremental(
+        source=str(src),
+        target=str(tmp_path / "tgt"),
+        merge_on="id",
+        partition_by="region",
+        by_partition=True,
+        by_partition_workers=3,
+    )
+    def pipe(lf: pl.LazyFrame) -> pl.LazyFrame:
+        df = cast(pl.DataFrame, lf.collect())
+        if "US" in df["region"].to_list():
+            raise RuntimeError("boom")
+        return df.lazy()
+
+    with pytest.raises(RuntimeError, match="boom"):
+        pipe.run()
+
+    with pytest.raises(Exception):  # noqa: B017 - no watermark table was ever committed
+        pipe.status()

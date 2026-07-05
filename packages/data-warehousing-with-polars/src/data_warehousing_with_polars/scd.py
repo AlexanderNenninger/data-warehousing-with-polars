@@ -6,12 +6,14 @@ SCD Type 2 (valid_from/valid_to history) and Type 4 (separate history table) wri
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import threading
 from datetime import date, datetime, timezone
 from typing import cast
 
 import polars as pl
-from deltalake import DeltaTable, WriterProperties, write_deltalake
+from deltalake import CommitProperties, DeltaTable, WriterProperties, write_deltalake
 from deltalake.exceptions import TableNotFoundError
 
 logger = logging.getLogger(__name__)
@@ -76,6 +78,7 @@ def _upsert_overwrite(
     df: pl.DataFrame,
     join_cols: list[str],
     partition_list: list[str] | None,
+    commit_properties: CommitProperties | None = None,
 ) -> None:
     """Upsert *df* into *target* by rewriting only the affected data, avoiding ``MERGE``.
 
@@ -111,6 +114,7 @@ def _upsert_overwrite(
                 "predicate": predicate,
                 "partition_by": partition_list,
                 "writer_properties": WriterProperties(),
+                "commit_properties": commit_properties,
             },
         )
         return
@@ -125,6 +129,7 @@ def _upsert_overwrite(
             "configuration": _CDF_CONFIG,
             "partition_by": partition_list,
             "writer_properties": WriterProperties(),
+            "commit_properties": commit_properties,
         },
     )
 
@@ -134,6 +139,8 @@ def _sink_scd2(
     lf: pl.LazyFrame,
     merge_on: str | list[str],
     partition_by: str | list[str] | None = None,
+    commit_properties: CommitProperties | None = None,
+    creation_lock: threading.Lock | None = None,
 ) -> None:
     """Write *lf* to a SCD Type 2 table, closing old versions and appending new ones.
 
@@ -156,18 +163,20 @@ def _sink_scd2(
     ).collect()
     df = cast(pl.DataFrame, _raw)
 
-    try:
-        DeltaTable(target)  # existence probe; raises TableNotFoundError on first run
-    except TableNotFoundError:
-        write_deltalake(
-            target,
-            df.to_arrow(),
-            mode="overwrite",
-            configuration=_CDF_CONFIG,
-            partition_by=partition_list,
-            writer_properties=WriterProperties(),
-        )
-        return
+    with creation_lock or contextlib.nullcontext():
+        try:
+            DeltaTable(target)  # existence probe; raises TableNotFoundError on first run
+        except TableNotFoundError:
+            write_deltalake(
+                target,
+                df.to_arrow(),
+                mode="overwrite",
+                configuration=_CDF_CONFIG,
+                partition_by=partition_list,
+                writer_properties=WriterProperties(),
+                commit_properties=commit_properties,
+            )
+            return
 
     # Step 1: Close existing current versions for keys in the incoming batch.
     # Done as a full-table rewrite rather than a Delta MERGE: delta-rs 1.6's MERGE is
@@ -208,6 +217,7 @@ def _sink_scd2(
                 "predicate": predicate,
                 "partition_by": partition_list,
                 "writer_properties": WriterProperties(),
+                "commit_properties": commit_properties,
             },
         )
     else:
@@ -219,6 +229,7 @@ def _sink_scd2(
                 "configuration": _CDF_CONFIG,
                 "partition_by": partition_list,
                 "writer_properties": WriterProperties(),
+                "commit_properties": commit_properties,
             },
         )
 
@@ -235,7 +246,11 @@ def _sink_scd2(
     )
     if len(new_df) > 0:
         write_deltalake(
-            target, new_df.to_arrow(), mode="append", writer_properties=WriterProperties()
+            target,
+            new_df.to_arrow(),
+            mode="append",
+            writer_properties=WriterProperties(),
+            commit_properties=commit_properties,
         )
 
 
@@ -245,6 +260,8 @@ def _sink_scd4(
     lf: pl.LazyFrame,
     merge_on: str | list[str],
     partition_by: str | list[str] | None = None,
+    commit_properties: CommitProperties | None = None,
+    creation_lock: threading.Lock | None = None,
 ) -> None:
     """Write *lf* to a SCD Type 4 table pair.
 
@@ -262,28 +279,41 @@ def _sink_scd4(
     _raw = lf.collect()
     df = cast(pl.DataFrame, _raw).unique(subset=keys, keep="last")
 
-    try:
-        DeltaTable(target)  # existence probe; raises TableNotFoundError on first run
+    with creation_lock or contextlib.nullcontext():
+        try:
+            DeltaTable(target)  # existence probe; raises TableNotFoundError on first run
+            target_exists = True
+        except TableNotFoundError:
+            write_deltalake(
+                target,
+                df.to_arrow(),
+                mode="overwrite",
+                configuration=_CDF_CONFIG,
+                partition_by=partition_list,
+                writer_properties=WriterProperties(),
+                commit_properties=commit_properties,
+            )
+            target_exists = False
 
-        # Step 1: Archive current versions of affected records. The target is scanned
-        # out-of-core via the streaming engine; the inner join against the batch's
-        # distinct keys bounds the result to one row per incoming key.
-        incoming_keys = df.select(keys).unique()
-        _current = (
-            pl.scan_delta(target)
-            .join(incoming_keys.lazy(), on=keys, how="inner")
-            .with_columns(pl.lit(now).alias("superseded_at"))
-            .collect(engine="streaming")
-        )
-        current = cast(pl.DataFrame, _current)
-        if len(current) > 0:
+    if not target_exists:
+        return
+
+    # Step 1: Archive current versions of affected records. The target is scanned
+    # out-of-core via the streaming engine; the inner join against the batch's
+    # distinct keys bounds the result to one row per incoming key.
+    incoming_keys = df.select(keys).unique()
+    _current = (
+        pl.scan_delta(target)
+        .join(incoming_keys.lazy(), on=keys, how="inner")
+        .with_columns(pl.lit(now).alias("superseded_at"))
+        .collect(engine="streaming")
+    )
+    current = cast(pl.DataFrame, _current)
+    if len(current) > 0:
+        with creation_lock or contextlib.nullcontext():
             try:
-                write_deltalake(
-                    history_target,
-                    current.to_arrow(),
-                    mode="append",
-                    writer_properties=WriterProperties(),
-                )
+                DeltaTable(history_target)  # existence probe
+                history_exists = True
             except TableNotFoundError:
                 write_deltalake(
                     history_target,
@@ -291,17 +321,17 @@ def _sink_scd4(
                     mode="overwrite",
                     configuration=_CDF_CONFIG,
                     writer_properties=WriterProperties(),
+                    commit_properties=commit_properties,
                 )
+                history_exists = False
+        if history_exists:
+            write_deltalake(
+                history_target,
+                current.to_arrow(),
+                mode="append",
+                writer_properties=WriterProperties(),
+                commit_properties=commit_properties,
+            )
 
-        # Step 2: Upsert current state (SCD Type 1 semantics).
-        _upsert_overwrite(target, df, keys, partition_list)
-
-    except TableNotFoundError:
-        write_deltalake(
-            target,
-            df.to_arrow(),
-            mode="overwrite",
-            configuration=_CDF_CONFIG,
-            partition_by=partition_list,
-            writer_properties=WriterProperties(),
-        )
+    # Step 2: Upsert current state (SCD Type 1 semantics).
+    _upsert_overwrite(target, df, keys, partition_list, commit_properties=commit_properties)
