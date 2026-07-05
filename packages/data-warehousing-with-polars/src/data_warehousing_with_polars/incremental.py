@@ -103,30 +103,29 @@ def _scan_files(
     paths: list[str],
     fmt: FileFormat,
     reader_kwargs: dict | None = None,
-    concat_options: dict | None = None,
 ) -> pl.LazyFrame:
     """Lazily scan *paths* into a single LazyFrame, tagging rows with ``_source_file``
     and ``_ingested_at``.
+
+    All paths are handed to a single ``pl.scan_parquet``/``scan_csv``/``scan_ndjson``
+    call rather than scanned one-by-one and unioned with ``pl.concat``. A per-file
+    scan-then-concat defeats Polars' own file pruning: filtering the resulting union
+    down to one partition (as ``by_partition`` does, once per partition) still
+    touches every file's data on every filter, turning O(files) work into
+    O(files^2). A single multi-file scan lets Polars skip non-matching files per
+    filter, which is what ``include_file_paths`` restores the per-row source path
+    for.
     """
     kwargs = reader_kwargs or {}
     now = datetime.now(timezone.utc)
-    frames: list[pl.LazyFrame] = []
 
-    for path in paths:
-        if fmt == "parquet":
-            lf = pl.scan_parquet(path, **kwargs)
-        elif fmt == "csv":
-            lf = pl.scan_csv(path, **kwargs)
-        else:  # ndjson
-            lf = pl.scan_ndjson(path, **kwargs)
-        lf = lf.with_columns(
-            pl.lit(path).alias("_source_file"),
-            pl.lit(now).alias("_ingested_at"),
-        )
-        frames.append(lf)
-
-    cc = concat_options or {}
-    return pl.concat(frames, **cc)
+    if fmt == "parquet":
+        lf = pl.scan_parquet(paths, include_file_paths="_source_file", **kwargs)
+    elif fmt == "csv":
+        lf = pl.scan_csv(paths, include_file_paths="_source_file", **kwargs)
+    else:  # ndjson
+        lf = pl.scan_ndjson(paths, include_file_paths="_source_file", **kwargs)
+    return lf.with_columns(pl.lit(now).alias("_ingested_at"))
 
 
 def _partition_list(partition_by: str | list[str] | None) -> list[str] | None:
@@ -330,13 +329,11 @@ class _DirSource:
         file_format: FileFormat,
         suffixes: tuple[str, ...],
         reader_kwargs: dict | None,
-        concat_options: dict | None,
     ) -> None:
         self._root = root
         self._file_format = file_format
         self._suffixes = suffixes
         self._reader_kwargs = reader_kwargs
-        self._concat_options = concat_options
 
     def poll(self, since: object | None) -> Batch | None:
         processed = set(since) if isinstance(since, list) else set()
@@ -347,7 +344,7 @@ class _DirSource:
         new_files = sorted(p for p in all_files if p not in processed)
         if not new_files:
             return None
-        frame = _scan_files(new_files, self._file_format, self._reader_kwargs, self._concat_options)
+        frame = _scan_files(new_files, self._file_format, self._reader_kwargs)
         return Batch(frame=frame, cursor=sorted(processed | set(new_files)))
 
 
@@ -434,7 +431,6 @@ def incremental(
     compute_context: object | None = None,
     staging: str | None = None,
     reader_kwargs: dict | None = None,
-    concat_options: dict | None = None,
     by_partition: bool = False,
     by_partition_workers: int = 4,
 ) -> Callable:
@@ -484,7 +480,6 @@ def incremental(
         compute_context: ``polars_cloud.ComputeContext`` for remote execution.
         staging:         Unused. Kept for backwards compatibility.
         reader_kwargs:   Forwarded to the file scanner (``pl.scan_parquet`` etc.).
-        concat_options:  Forwarded to ``pl.concat`` when combining files.
         by_partition_workers: Number of partitions processed concurrently when
                          ``by_partition=True`` (default ``4``); ignored otherwise. Each
                          worker independently loads, transforms, and writes one partition,
@@ -613,7 +608,6 @@ def incremental(
             compute_context=compute_context,
             staging=staging,
             reader_kwargs=reader_kwargs,
-            concat_options=concat_options,
             by_partition=by_partition,
             by_partition_workers=by_partition_workers,
         )
@@ -664,7 +658,6 @@ class IncrementalPipeline:
         compute_context: object | None = None,
         staging: str | None = None,
         reader_kwargs: dict | None = None,
-        concat_options: dict | None = None,
         by_partition: bool = False,
         by_partition_workers: int = 4,
         fail_on_version_mismatch: bool = False,
@@ -699,7 +692,6 @@ class IncrementalPipeline:
         self.compute_context = compute_context
         self.staging = staging
         self.reader_kwargs = reader_kwargs
-        self.concat_options = concat_options
         self.by_partition = by_partition
         self.by_partition_workers = by_partition_workers
         self.fail_on_version_mismatch = fail_on_version_mismatch
@@ -714,7 +706,7 @@ class IncrementalPipeline:
                 return item
             if file_format == "delta":
                 return _DeltaCdfSource(item)
-            return _DirSource(item, file_format, suffixes, reader_kwargs, concat_options)
+            return _DirSource(item, file_format, suffixes, reader_kwargs)
 
         items = cast("list[str | Source]", source if isinstance(source, list) else [source])
         self._sources: list[Source] = [_as_source(it) for it in items]
