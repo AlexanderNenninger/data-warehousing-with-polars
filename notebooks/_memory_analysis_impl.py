@@ -70,10 +70,34 @@ def run_pure_polars(tmp_path: str, rows_per_partition: int) -> None:
     lf.sink_parquet(
         pl.PartitionBy(
             str(p / "target"),
-            # key="measurement",
-            max_rows_per_file=rows_per_partition,
+            key="measurement",
         )
     )
+
+    delta = m.delta_mb()
+    m.stop()
+    _check(delta)
+
+
+def run_by_partition(tmp_path: str, rows_per_partition: int) -> None:
+    p = Path(tmp_path)
+    src = p / "src"
+
+    @incremental(
+        source=str(src),
+        target=str(p / "target"),
+        merge_on=None,
+        partition_by="measurement",
+        by_partition=True,
+        by_partition_workers=1,
+    )
+    def pipeline(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf
+
+    m = _RSSMeasurement()
+    m.reset()
+
+    pipeline.run()
 
     delta = m.delta_mb()
     m.stop()
