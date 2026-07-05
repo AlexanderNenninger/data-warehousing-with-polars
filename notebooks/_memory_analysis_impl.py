@@ -36,29 +36,6 @@ def _check(delta: float) -> None:
 # ── Workers ───────────────────────────────────────────────────────────────────
 
 
-def run_pipeline(tmp_path: str, n_partitions: int, rows_per_partition: int) -> None:
-    p = Path(tmp_path)
-    src = p / "src"
-    src.mkdir()
-
-    @incremental(
-        source=str(src),
-        target=str(p / "target"),
-        # merge_on="measurement",
-        merge_on=None,
-        partition_by="measurement",
-    )
-    def pipeline(lf: pl.LazyFrame) -> pl.LazyFrame:
-        return lf
-
-    m = _RSSMeasurement()
-    m.reset()
-    pipeline.run()
-    delta = m.delta_mb()
-    m.stop()
-    _check(delta)
-
-
 def run_pure_polars(tmp_path: str, rows_per_partition: int) -> None:
     p = Path(tmp_path)
     src = p / "src"
@@ -67,12 +44,34 @@ def run_pure_polars(tmp_path: str, rows_per_partition: int) -> None:
     m.reset()
 
     lf = pl.scan_parquet(str(src / "**" / "*.parquet"))
-    lf.sink_parquet(
-        pl.PartitionBy(
-            str(p / "target"),
-            key="measurement",
-        )
+    lf.sink_delta(
+        str(p / "target"),
+        delta_write_options={"partition_by": ["measurement"]},
     )
+
+    delta = m.delta_mb()
+    m.stop()
+    _check(delta)
+
+
+def run_all(tmp_path: str, rows_per_partition: int) -> None:
+    p = Path(tmp_path)
+    src = p / "src"
+
+    @incremental(
+        source=str(src),
+        target=str(p / "target"),
+        merge_on=None,
+        partition_by="measurement",
+        by_partition=False,
+    )
+    def pipeline(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf
+
+    m = _RSSMeasurement()
+    m.reset()
+
+    pipeline.run()
 
     delta = m.delta_mb()
     m.stop()
