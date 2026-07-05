@@ -156,27 +156,36 @@ def _sink_scd2(
         else (list(partition_by) if partition_by else None)
     )
 
-    _raw = lf.with_columns(
+    lf_versioned = lf.with_columns(
         pl.lit(now).alias("valid_from"),
         pl.lit(None).cast(pl.Datetime("us", "UTC")).alias("valid_to"),
         pl.lit(True).alias("is_current"),
-    ).collect()
-    df = cast(pl.DataFrame, _raw)
+    )
 
     with creation_lock or contextlib.nullcontext():
         try:
             DeltaTable(target)  # existence probe; raises TableNotFoundError on first run
+            table_exists = True
         except TableNotFoundError:
-            write_deltalake(
+            table_exists = False
+            # Streaming create: data flows chunk-by-chunk without ever materialising
+            # the whole first batch as one in-memory DataFrame (unlike the
+            # collect() + write_deltalake() this replaces).
+            lf_versioned.sink_delta(
                 target,
-                df.to_arrow(),
                 mode="overwrite",
-                configuration=_CDF_CONFIG,
-                partition_by=partition_list,
-                writer_properties=WriterProperties(),
-                commit_properties=commit_properties,
+                delta_write_options={
+                    "configuration": _CDF_CONFIG,
+                    "partition_by": partition_list,
+                    "writer_properties": WriterProperties(),
+                    "commit_properties": commit_properties,
+                },
             )
-            return
+
+    if not table_exists:
+        return
+
+    df = cast(pl.DataFrame, lf_versioned.collect(engine="streaming"))
 
     # Step 1: Close existing current versions for keys in the incoming batch.
     # Done as a full-table rewrite rather than a Delta MERGE: delta-rs 1.6's MERGE is
@@ -276,27 +285,32 @@ def _sink_scd4(
         else (list(partition_by) if partition_by else None)
     )
 
-    _raw = lf.collect()
-    df = cast(pl.DataFrame, _raw).unique(subset=keys, keep="last")
+    lf_dedup = lf.unique(subset=keys, keep="last")
 
     with creation_lock or contextlib.nullcontext():
         try:
             DeltaTable(target)  # existence probe; raises TableNotFoundError on first run
             target_exists = True
         except TableNotFoundError:
-            write_deltalake(
-                target,
-                df.to_arrow(),
-                mode="overwrite",
-                configuration=_CDF_CONFIG,
-                partition_by=partition_list,
-                writer_properties=WriterProperties(),
-                commit_properties=commit_properties,
-            )
             target_exists = False
+            # Streaming create: data flows chunk-by-chunk without ever materialising
+            # the whole first batch as one in-memory DataFrame (unlike the
+            # collect() + write_deltalake() this replaces).
+            lf_dedup.sink_delta(
+                target,
+                mode="overwrite",
+                delta_write_options={
+                    "configuration": _CDF_CONFIG,
+                    "partition_by": partition_list,
+                    "writer_properties": WriterProperties(),
+                    "commit_properties": commit_properties,
+                },
+            )
 
     if not target_exists:
         return
+
+    df = cast(pl.DataFrame, lf_dedup.collect(engine="streaming"))
 
     # Step 1: Archive current versions of affected records. The target is scanned
     # out-of-core via the streaming engine; the inner join against the batch's
