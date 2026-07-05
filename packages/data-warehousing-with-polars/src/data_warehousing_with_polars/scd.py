@@ -145,8 +145,16 @@ def _sink_scd2(
     """Write *lf* to a SCD Type 2 table, closing old versions and appending new ones.
 
     Injects ``valid_from``, ``valid_to``, and ``is_current`` columns. On subsequent
-    runs: closes matching current rows (sets ``valid_to = now``, ``is_current = false``),
-    then appends new rows. Deduplicates on ``(merge_on, valid_from)`` for idempotency.
+    runs: closes matching current rows (sets ``valid_to = now``, ``is_current = false``)
+    and appends new (deduplicated on ``(merge_on, valid_from)``) rows in a single
+    commit — one ``sink_delta`` overwrite of just the touched partitions (or the
+    whole table, unpartitioned) — rather than a separate close-commit followed by a
+    separate append-commit. Each extra commit costs more the larger the table's
+    history gets (delta-rs reloads/validates the growing transaction log per
+    commit), so halving the commit count here matters more as the table grows, not
+    less — this is what makes ``by_partition=True`` a net win here instead of a net
+    loss (two commits per partition, each against a table whose history is now N
+    times longer, cost more than one bigger commit against a table touched once).
     """
     now = datetime.now(timezone.utc)
     keys = [merge_on] if isinstance(merge_on, str) else list(merge_on)
@@ -187,16 +195,16 @@ def _sink_scd2(
 
     df = cast(pl.DataFrame, lf_versioned.collect(engine="streaming"))
 
-    # Step 1: Close existing current versions for keys in the incoming batch.
-    # Done as a full-table rewrite rather than a Delta MERGE: delta-rs 1.6's MERGE is
+    # Close existing current versions for keys in the incoming batch. Done as a
+    # full-table rewrite rather than a Delta MERGE: delta-rs 1.6's MERGE is
     # unreliable on object-store (S3) targets at scale (see _upsert_overwrite). Only
     # rows that are currently open AND whose key appears in the batch are closed.
     #
     # When the target is partitioned (and the partition values render into a
-    # ``replaceWhere`` predicate), the close rewrite is narrowed to *just the
-    # partitions the batch touches* — reading and overwriting only those partitions
-    # instead of the whole table, exactly as ``_upsert_overwrite`` does. This assumes
-    # a key's partition value is stable across runs (the same assumption upserts make).
+    # ``replaceWhere`` predicate), the rewrite is narrowed to *just the partitions
+    # the batch touches* — reading and overwriting only those partitions instead of
+    # the whole table, exactly as ``_upsert_overwrite`` does. This assumes a key's
+    # partition value is stable across runs (the same assumption upserts make).
     incoming = df.select(keys).unique().with_columns(pl.lit(True).alias("__match"))
     to_close = pl.col("__match").fill_null(False) & pl.col("is_current")
     predicate = _partition_predicate(df, partition_list) if partition_list else None
@@ -214,12 +222,20 @@ def _sink_scd2(
             .drop("__match")
         )
 
+    # New rows are deduplicated on (key, valid_from) for idempotency when the
+    # pipeline is re-run on the same batch. `_close` never changes `valid_from`, so
+    # `existing`'s (key, valid_from) set is the same whether read before or after
+    # this commit — one scan of `existing` safely covers both the close-join and
+    # this anti-join, rather than a second, separate scan later.
+    dedup_cols = keys + ["valid_from"]
+
     if predicate is not None:
         assert partition_list is not None
         existing = pl.scan_delta(target)
         for col in partition_list:
             existing = existing.filter(pl.col(col).is_in(df[col].unique().to_list()))
-        _close(existing).sink_delta(
+        new_rows = lf_versioned.join(existing.select(dedup_cols), on=dedup_cols, how="anti")
+        pl.concat([_close(existing), new_rows], how="diagonal_relaxed").sink_delta(
             target,
             mode="overwrite",
             delta_write_options={
@@ -230,7 +246,9 @@ def _sink_scd2(
             },
         )
     else:
-        _close(pl.scan_delta(target)).sink_delta(
+        existing = pl.scan_delta(target)
+        new_rows = lf_versioned.join(existing.select(dedup_cols), on=dedup_cols, how="anti")
+        pl.concat([_close(existing), new_rows], how="diagonal_relaxed").sink_delta(
             target,
             mode="overwrite",
             delta_write_options={
@@ -240,26 +258,6 @@ def _sink_scd2(
                 "writer_properties": WriterProperties(),
                 "commit_properties": commit_properties,
             },
-        )
-
-    # Step 2: Append new current versions, deduplicating on (key, valid_from)
-    # for idempotency when the pipeline is re-run on the same batch. The existing
-    # ``(key, valid_from)`` set is scanned out-of-core via the streaming engine; the
-    # anti-join result is bounded by the incoming batch, so it materialises safely.
-    dedup_cols = keys + ["valid_from"]
-    new_df = cast(
-        pl.DataFrame,
-        df.lazy()
-        .join(pl.scan_delta(target).select(dedup_cols), on=dedup_cols, how="anti")
-        .collect(engine="streaming"),
-    )
-    if len(new_df) > 0:
-        write_deltalake(
-            target,
-            new_df.to_arrow(),
-            mode="append",
-            writer_properties=WriterProperties(),
-            commit_properties=commit_properties,
         )
 
 
