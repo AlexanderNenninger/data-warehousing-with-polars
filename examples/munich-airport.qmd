@@ -46,7 +46,7 @@ df = (
     .collect()
     .sort("date")
 )
-df.head(5)
+df.tail(5)
 ```
 
 ## Monthly passenger volume
