@@ -1,0 +1,35 @@
+name: Munich Solar Pipeline
+
+on:
+  schedule:
+    # Run every Monday at 06:00 UTC. SMARD publishes day-ahead prices daily and
+    # DWD's station file updates more often than the monthly Statistisches Amt
+    # releases, so this pipeline refreshes weekly rather than monthly.
+    - cron: "0 6 * * 1"
+  workflow_dispatch: # allow manual trigger from the Actions UI
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install uv
+        run: python -m pip install uv
+
+      - name: Install package
+        run: uv sync --package data-warehousing-with-polars
+
+      - name: Run pipeline
+        run: uv run python app/munich_solar.py
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          MUNICH_CYCLING_BUCKET: ${{ secrets.MUNICH_CYCLING_BUCKET || 'data-warehousing-with-polars' }}
