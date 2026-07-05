@@ -42,7 +42,7 @@ df = (
     .collect()
     .sort("date")
 )
-df.head(5)
+df.drop_nulls().tail(5)
 ```
 
 ## Monthly unemployment

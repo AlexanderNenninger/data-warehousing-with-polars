@@ -40,7 +40,7 @@ daily = (
     .collect()
     .sort("datum")
 )
-daily.head(5)
+daily.drop_nulls().tail(5)
 ```
 
 ## City-wide daily counts
