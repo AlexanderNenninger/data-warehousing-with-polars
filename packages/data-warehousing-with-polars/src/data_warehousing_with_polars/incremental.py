@@ -24,7 +24,7 @@ from deltalake.exceptions import TableNotFoundError
 
 from .maintenance import _load_run_count, _save_run_count, maintain
 from .record_batch_source import make_lazy
-from .scd import _sink_scd2, _sink_scd4, _upsert_overwrite
+from .scd import _sink_scd2, _sink_scd4, _sql_literal, _upsert_overwrite
 
 logger = logging.getLogger(__name__)
 
@@ -883,19 +883,23 @@ class IncrementalPipeline:
     def _process_partition_combo(
         self,
         combo: dict[str, object],
-        resolved: dict[int, pl.LazyFrame | pl.DataFrame],
+        resolved: dict[int, pl.LazyFrame | Callable[[dict[str, object]], pl.LazyFrame]],
         commit_properties: CommitProperties | None,
         creation_lock: threading.Lock | None,
     ) -> None:
-        """Filter every resolved source frame down to *combo*, run ``fn``, and sink the result."""
+        """Filter every resolved source frame down to *combo*, run ``fn``, and sink the result.
 
-        def _as_lazy(f: pl.LazyFrame | pl.DataFrame) -> pl.LazyFrame:
-            return f if isinstance(f, pl.LazyFrame) else f.lazy()
-
+        A callable entry (single-use Delta CDF sources) is invoked with *combo* to build
+        a fresh, already partition-scoped frame — see ``_run_by_partition`` — so it is
+        used as-is rather than filtered again here.
+        """
         filt = pl.all_horizontal([pl.col(c) == v for c, v in combo.items()])
-        partition_frames = [
-            _as_lazy(resolved[i]).filter(filt) for i in range(len(self._sources)) if i in resolved
-        ]
+        partition_frames = []
+        for i in range(len(self._sources)):
+            if i not in resolved:
+                continue
+            r = resolved[i]
+            partition_frames.append(r.filter(filt) if isinstance(r, pl.LazyFrame) else r(combo))
         self._dispatch_sink(
             self.fn(*partition_frames),
             commit_properties=commit_properties,
@@ -922,32 +926,80 @@ class IncrementalPipeline:
         part_cols = _partition_list(self.partition_by)
         assert part_cols is not None  # guaranteed by __init__ validation
 
-        # Build a resolved frame for every source slot that can contribute to fn's
+        # Build a resolved entry for every source slot that can contribute to fn's
         # argument list.  Active CDF sources whose cursor is not None are single-use
-        # RecordBatchReader streams — collect them once.  Re-scannable sources
-        # (scan_delta on first run, scan_parquet concat) stay lazy so partition
-        # pruning applies per iteration.  Idle _DeltaCdfSource slots get a 0-row
-        # lazy frame so fn receives a consistent argument count across partitions.
+        # RecordBatchReader streams that can't be re-scanned per partition combo like
+        # a file source can — instead of collecting (or spilling) the whole batch once,
+        # store a factory that re-invokes `load_cdf` per combo with a fresh SQL
+        # predicate scoped to that partition's values.  delta-rs prunes at the source
+        # (see the timing note below), so this gets the same per-partition memory/IO
+        # bound file-based sources already have, with no local disk copy either.
+        # Re-scannable sources (scan_delta on first run, scan_parquet concat) stay
+        # lazy directly.  Idle _DeltaCdfSource slots get a 0-row lazy frame so fn
+        # receives a consistent argument count across partitions.
         active_slots = {slot_i for slot_i, _ in batches}
-        resolved: dict[int, pl.LazyFrame | pl.DataFrame] = {}
+        resolved: dict[int, pl.LazyFrame | Callable[[dict[str, object]], pl.LazyFrame]] = {}
+        # Separate, column-projected frames used only to enumerate the distinct
+        # partition combos in this run — cheap even for a CDF source, since `columns=`
+        # is pushed down to delta-rs rather than reading (or spilling) every column.
+        enum_frames: dict[int, pl.LazyFrame] = {}
+
         for i, src in enumerate(self._sources):
             if i in active_slots:
                 batch = next(b for slot, b in batches if slot == i)
                 single_use = isinstance(src, _DeltaCdfSource) and cursors.get(i) is not None
-                resolved[i] = (
-                    cast(pl.DataFrame, batch.frame.collect()) if single_use else batch.frame
-                )
+                if single_use:
+                    cdf_src = cast(_DeltaCdfSource, src)
+                    dt = DeltaTable(cdf_src._source_path)
+                    from_version = cast(int, cursors[i])
+                    ending_version = cast(int, batch.cursor)
+                    schema = pl.scan_delta(cdf_src._source_path).collect_schema()
+
+                    def _cdf_combo_lf(
+                        combo: dict[str, object],
+                        dt: DeltaTable = dt,
+                        from_version: int = from_version,
+                        ending_version: int = ending_version,
+                        schema: pl.Schema = schema,
+                    ) -> pl.LazyFrame:
+                        predicate = " AND ".join(
+                            f"{col} = {_sql_literal(combo[col], schema[col])}" for col in part_cols
+                        )
+                        reader = dt.load_cdf(
+                            starting_version=from_version + 1,
+                            ending_version=ending_version,
+                            predicate=predicate,
+                        )
+                        return (
+                            make_lazy(reader)
+                            .filter(pl.col("_change_type").is_in(["insert", "update_postimage"]))
+                            .drop(["_change_type", "_commit_version", "_commit_timestamp"])
+                        )
+
+                    resolved[i] = _cdf_combo_lf
+                    enum_reader = dt.load_cdf(
+                        starting_version=from_version + 1,
+                        ending_version=ending_version,
+                        columns=[*part_cols, "_change_type"],
+                    )
+                    enum_frames[i] = (
+                        make_lazy(enum_reader)
+                        .filter(pl.col("_change_type").is_in(["insert", "update_postimage"]))
+                        .select(part_cols)
+                    )
+                else:
+                    resolved[i] = batch.frame
+                    enum_frames[i] = batch.frame
             elif isinstance(src, _DeltaCdfSource):
                 # Idle Delta source: schema is available from the transaction log.
-                resolved[i] = pl.scan_delta(src._source_path).head(0)
+                idle_lf = pl.scan_delta(src._source_path).head(0)
+                resolved[i] = idle_lf
+                enum_frames[i] = idle_lf
             # Other idle source types: omitted (schema unknowable without reading data).
 
-        def _as_lazy(f: pl.LazyFrame | pl.DataFrame) -> pl.LazyFrame:
-            return f if isinstance(f, pl.LazyFrame) else f.lazy()
-
         # Enumerate distinct partition combos from ACTIVE sources only.
-        active_frames = [resolved[i] for i in sorted(active_slots) if i in resolved]
-        part_frames = [_as_lazy(f).select(part_cols).unique() for f in active_frames]
+        active_frames = [enum_frames[i] for i in sorted(active_slots) if i in enum_frames]
+        part_frames = [f.select(part_cols).unique() for f in active_frames]
         combos = pl.concat(part_frames).unique().sort(part_cols).collect().to_dicts()
 
         for combo in combos:

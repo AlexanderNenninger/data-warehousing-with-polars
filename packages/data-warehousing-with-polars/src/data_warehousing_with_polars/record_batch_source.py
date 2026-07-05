@@ -64,18 +64,21 @@ def make_lazy(reader: "pa.RecordBatchReader") -> pl.LazyFrame:
                 batch = reader.read_next_batch()
             except StopIteration:
                 return
-            _batch_df = cast(pl.DataFrame, pl.from_arrow(batch))
-            df = _batch_df
+            df = cast(pl.DataFrame, pl.from_arrow(batch))
             if with_columns is not None:
                 present = [c for c in with_columns if c in df.columns]
                 df = df.select(present)
+            if predicate is not None:
+                df = df.filter(predicate)
+            if len(df) == 0:
+                continue
             if n_rows is not None:
                 remaining = n_rows - rows_yielded
                 if remaining <= 0:
                     return
                 df = df.head(remaining)
-            if len(df) == 0:
-                continue
+                if len(df) == 0:
+                    continue
             rows_yielded += len(df)
             yield df
             if n_rows is not None and rows_yielded >= n_rows:
