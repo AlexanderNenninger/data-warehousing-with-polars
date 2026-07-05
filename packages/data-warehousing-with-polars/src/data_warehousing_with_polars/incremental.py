@@ -193,15 +193,18 @@ def _sink_target(
             first_write = True
 
         if first_write:
-            _df = cast(pl.DataFrame, lf.collect() if not keys else lf.collect(engine="streaming"))
-            write_deltalake(
+            # Streaming create: same fused write as the append path below, data flows
+            # chunk-by-chunk without ever materialising the full result as one
+            # in-memory DataFrame (which `.collect()` + `write_deltalake()` would).
+            lf.sink_delta(
                 target,
-                _df.to_arrow(),
                 mode="overwrite",
-                configuration=_CDF_CONFIG,
-                partition_by=partition_list,
-                writer_properties=WriterProperties(),
-                commit_properties=commit_properties,
+                delta_write_options={
+                    "configuration": _CDF_CONFIG,
+                    "partition_by": partition_list,
+                    "writer_properties": WriterProperties(),
+                    "commit_properties": commit_properties,
+                },
             )
             return
 
