@@ -1,0 +1,567 @@
+---
+title: Munich Solar & Battery Storage Economics
+---
+
+Since 2025, German electricity suppliers must offer *dynamic* tariffs indexed
+to the [SMARD](https://www.smard.de) day-ahead spot price (§41a EnWG). This
+demo asks: for a Munich household with rooftop solar on such a tariff, how
+much does adding a **home battery** save — by storing surplus solar instead of
+exporting it at the low, fixed feed-in tariff, and by covering evening demand
+instead of buying at whatever the spot price happens to be that hour?
+
+PV generation is modeled from real hourly irradiance at
+[Weihenstephan-Dürnast](https://www.dwd.de) (DWD station 05404, ~30 km north
+of Munich near Freising — the closest DWD radiation-measuring station, since
+none exists inside the city itself). Grid cost is modeled from the real SMARD
+DE-LU day-ahead price. Both are ingested by
+[`munich_solar.py`](../reference/incremental.incremental.qmd) using
+[`@incremental`](../reference/incremental.incremental.qmd) and
+[`@schema`](../reference/schema.schema.qmd).
+
+**Data sources:** SMARD / Bundesnetzagentur · DWD Climate Data Center ·
+License: [Datenlizenz Deutschland – Namensnennung 2.0](https://www.govdata.de/dl-de/by-2-0)
+
+```{python}
+#| echo: false
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    print("python-dotenv not found, skipping .env loading")
+```
+```{python}
+#| echo: false
+import os
+
+import altair as alt
+import polars as pl
+
+BUCKET = os.environ.get("MUNICH_CYCLING_BUCKET", "data-warehousing-with-polars")
+```
+
+## Loading and joining the raw data
+
+```{python}
+#| echo: false
+price = pl.scan_delta(f"s3://{BUCKET}/delta/munich_solar_spot_price").select(
+    "timestamp", "price_eur_mwh"
+)
+irradiance = pl.scan_delta(f"s3://{BUCKET}/delta/munich_solar_irradiance").select(
+    "datetime_utc", "ghi_kwh_per_m2"
+)
+
+hourly = (
+    price.with_columns(
+        pl.col("timestamp").dt.replace_time_zone(None).cast(pl.Datetime("us")).alias("hour")
+    )
+    .join(irradiance, left_on="hour", right_on="datetime_utc", how="inner")
+    .sort("hour")
+    .collect()
+)
+hourly.drop_nulls().tail(5)
+```
+
+## Modeling PV generation and household load
+
+Generation is estimated for a fixed, typical German residential system —
+**8 kWp**, 85% performance ratio — as `irradiance × capacity × performance
+ratio`. This ignores panel tilt, orientation, and temperature derating, which
+a real yield estimate would include.
+
+Household consumption uses a synthetic diurnal profile (morning and evening
+peaks, a midday and overnight trough) applied identically every day and
+scaled to **4,000 kWh/year**, typical for a 2–3 person household. This is a
+simplification too: it ignores weekday/weekend and seasonal shape that a real
+smart-meter profile would show.
+
+```{python}
+#| echo: false
+CAPACITY_KWP = 8.0
+PERFORMANCE_RATIO = 0.85
+ANNUAL_LOAD_KWH = 4000.0
+
+# Synthetic hourly load-shape weights (00:00 .. 23:00) — morning + evening peaks.
+_LOAD_WEIGHTS = [
+    0.30, 0.25, 0.20, 0.20, 0.25, 0.40, 0.70, 1.00,
+    0.80, 0.60, 0.50, 0.50, 0.55, 0.50, 0.50, 0.60,
+    0.80, 1.20, 1.60, 1.80, 1.50, 1.10, 0.70, 0.45,
+]
+_weight_sum = sum(_LOAD_WEIGHTS)
+load_shape = pl.DataFrame(
+    {
+        "hour_of_day": list(range(24)),
+        "load_kwh": [w / _weight_sum * ANNUAL_LOAD_KWH / 365.0 for w in _LOAD_WEIGHTS],
+    }
+)
+
+sim = (
+    hourly.with_columns(pl.col("hour").dt.hour().alias("hour_of_day"))
+    .join(load_shape, on="hour_of_day", how="left")
+    .with_columns(
+        (pl.col("ghi_kwh_per_m2") * CAPACITY_KWP * PERFORMANCE_RATIO).alias("generation_kwh")
+    )
+    .with_columns((pl.col("generation_kwh") - pl.col("load_kwh")).alias("net_kwh"))
+    .drop_nulls(["net_kwh", "price_eur_mwh"])
+    .sort("hour")
+)
+
+correlation = sim.select(pl.corr("generation_kwh", "price_eur_mwh")).item()
+print(f"Annual generation: {sim['generation_kwh'].sum():,.0f} kWh")
+print(f"Annual load:       {sim['load_kwh'].sum():,.0f} kWh")
+print(f"Corr(generation, spot price): {correlation:.2f}")
+```
+
+This is the mismatch a battery gets paid to fix: PV output peaks around
+midday, while the assumed household load profile peaks in the morning and,
+more sharply, in the evening. Without storage, most solar generation happens
+when nobody's home to use it.
+
+```{python}
+#| echo: false
+avg_generation_by_hour = (
+    sim.group_by("hour_of_day")
+    .agg(pl.col("generation_kwh").mean().alias("Average PV generation"))
+    .sort("hour_of_day")
+)
+profile = load_shape.rename({"load_kwh": "Household load (assumed)"}).join(
+    avg_generation_by_hour, on="hour_of_day"
+)
+profile_long = profile.unpivot(
+    index="hour_of_day",
+    on=["Household load (assumed)", "Average PV generation"],
+    variable_name="series",
+    value_name="kwh",
+)
+
+alt.Chart(profile_long).mark_line(point=True).encode(
+    x=alt.X("hour_of_day:O", title="Hour of day"),
+    y=alt.Y("kwh:Q", title="kWh"),
+    color=alt.Color(
+        "series:N",
+        title=None,
+        scale=alt.Scale(
+            domain=["Household load (assumed)", "Average PV generation"],
+            range=["#4C78A8", "#F2A83A"],
+        ),
+    ),
+    tooltip=[
+        alt.Tooltip("hour_of_day:O", title="Hour"),
+        alt.Tooltip("series:N", title="Series"),
+        alt.Tooltip("kwh:Q", title="kWh", format=".2f"),
+    ],
+).properties(width="container", height=240).configure_view(strokeWidth=0)
+```
+
+## Simulating battery sizes
+
+State of charge is path-dependent, so this walks the hourly `generation −
+load` series **sequentially in Python** for each candidate battery size
+(0–15 kWh) — surplus charges the battery up to its capacity and any
+remainder is exported; a deficit discharges the battery and any remainder is
+bought from the grid at that hour's spot price. Each battery size reduces to
+three totals: grid purchase volume, its spot-market cost, and un-stored
+export volume.
+
+```{python}
+#| echo: false
+def simulate_battery(battery_kwh: float, nets: list[float], prices_mwh: list[float]):
+    soc = 0.0
+    deficit_kwh = 0.0
+    spot_cost_eur = 0.0
+    export_kwh = 0.0
+    for net, price_mwh in zip(nets, prices_mwh):
+        if net >= 0:
+            charge = min(net, battery_kwh - soc)
+            soc += charge
+            export_kwh += net - charge
+        else:
+            need = -net
+            discharge = min(need, soc)
+            soc -= discharge
+            remaining = need - discharge
+            deficit_kwh += remaining
+            spot_cost_eur += remaining * price_mwh / 1000.0
+    return deficit_kwh, spot_cost_eur, export_kwh
+
+
+_nets = sim["net_kwh"].to_list()
+_prices = sim["price_eur_mwh"].to_list()
+
+battery_scenarios = pl.DataFrame(
+    [
+        dict(
+            zip(
+                ("battery_kwh", "deficit_kwh", "spot_cost_eur", "export_kwh"),
+                (b, *simulate_battery(float(b), _nets, _prices)),
+            )
+        )
+        for b in range(16)
+    ]
+)
+
+# Carry the no-battery baseline onto every row so the interactive chart can
+# recompute "savings vs. no battery" for any slider values without re-running
+# the simulation in the browser.
+_baseline = battery_scenarios.filter(pl.col("battery_kwh") == 0).row(0, named=True)
+battery_scenarios = battery_scenarios.with_columns(
+    pl.lit(_baseline["deficit_kwh"]).alias("deficit_kwh_0"),
+    pl.lit(_baseline["spot_cost_eur"]).alias("spot_cost_eur_0"),
+    pl.lit(_baseline["export_kwh"]).alias("export_kwh_0"),
+)
+battery_scenarios.head(5)
+```
+
+## Battery economics — drag the sliders
+
+Grid markup (taxes, grid fees, supplier margin on top of the spot price),
+the statutory feed-in tariff for un-stored export, and battery installation
+cost are all linear in the totals computed above, so the sliders below
+recompute savings and payback live in the browser — no server, no
+re-simulation.
+
+```{python}
+#| echo: false
+markup_param = alt.param(
+    name="markup_ct_per_kwh",
+    value=20,
+    bind=alt.binding_range(min=10, max=30, step=1, name="Grid markup (ct/kWh): "),
+)
+fit_param = alt.param(
+    name="fit_ct_per_kwh",
+    value=8,
+    bind=alt.binding_range(min=0, max=15, step=0.5, name="Feed-in tariff (ct/kWh): "),
+)
+capex_param = alt.param(
+    name="capex_eur_per_kwh",
+    value=700,
+    bind=alt.binding_range(min=400, max=1200, step=25, name="Battery cost (€/kWh): "),
+)
+
+base = (
+    alt.Chart(battery_scenarios)
+    .transform_calculate(
+        total_cost=(
+            "datum.spot_cost_eur + datum.deficit_kwh * markup_ct_per_kwh / 100"
+            " - datum.export_kwh * fit_ct_per_kwh / 100"
+        ),
+        base_cost=(
+            "datum.spot_cost_eur_0 + datum.deficit_kwh_0 * markup_ct_per_kwh / 100"
+            " - datum.export_kwh_0 * fit_ct_per_kwh / 100"
+        ),
+    )
+    .transform_calculate(savings_eur="datum.base_cost - datum.total_cost")
+    .transform_calculate(
+        payback_years=(
+            "datum.battery_kwh == 0 ? null"
+            " : (datum.battery_kwh * capex_eur_per_kwh) / datum.savings_eur"
+        )
+    )
+)
+
+savings_chart = base.mark_line(point=True, color="#4C78A8").encode(
+    x=alt.X("battery_kwh:Q", title="Battery size (kWh)"),
+    y=alt.Y("savings_eur:Q", title="Annual savings vs. no battery (€/yr)"),
+    tooltip=[
+        alt.Tooltip("battery_kwh:Q", title="Battery (kWh)"),
+        alt.Tooltip("savings_eur:Q", title="Savings (€/yr)", format=",.0f"),
+    ],
+).properties(width="container", height=200)
+
+payback_chart = base.mark_line(point=True, color="#E45756").encode(
+    x=alt.X("battery_kwh:Q", title="Battery size (kWh)"),
+    y=alt.Y("payback_years:Q", title="Payback period (years)"),
+    tooltip=[
+        alt.Tooltip("battery_kwh:Q", title="Battery (kWh)"),
+        alt.Tooltip("payback_years:Q", title="Payback (years)", format=".1f"),
+    ],
+).properties(width="container", height=200)
+
+(savings_chart | payback_chart).add_params(markup_param, fit_param, capex_param)
+```
+
+With the defaults above (a system oversized relative to this household's
+demand, which is common when sized for future EV/heat-pump load), most of the
+reachable savings show up in the first few kWh of storage — beyond that,
+summer surplus already has nowhere to go, so extra capacity mostly sits idle
+and payback gets worse, not better. Raising the feed-in tariff slider flattens
+that curve, since idle capacity matters less when export pays more; raising
+the markup slider steepens it, since covering evening demand from the battery
+becomes more valuable relative to buying at spot.
+
+## A day with the battery
+
+The aggregate savings/payback curves above hide what actually happens hour by
+hour. Pick a **day** and a **battery size** below to walk through it: how full
+the battery gets, and whether that hour's demand was met directly from the
+panels, from the battery, or bought from the grid.
+
+```{python}
+#| echo: false
+def simulate_battery_trace(
+    battery_kwh: float, gens: list[float], loads: list[float]
+):
+    soc = 0.0
+    socs, self_consumption, charge, discharge, grid, export = [], [], [], [], [], []
+    for gen, load in zip(gens, loads):
+        net = gen - load
+        direct = min(gen, load)
+        if net >= 0:
+            c = min(net, battery_kwh - soc)
+            soc += c
+            self_consumption.append(direct)
+            charge.append(c)
+            discharge.append(0.0)
+            grid.append(0.0)
+            export.append(net - c)
+        else:
+            need = -net
+            d = min(need, soc)
+            soc -= d
+            self_consumption.append(direct)
+            charge.append(0.0)
+            discharge.append(d)
+            grid.append(need - d)
+            export.append(0.0)
+        socs.append(soc)
+    return socs, self_consumption, charge, discharge, grid, export
+
+
+BATTERY_SIZES_KWH = list(range(16))  # matches the sweep in the chart above
+```
+
+Four illustrative days are picked out of the real data rather than chosen by
+hand: the sunniest day, the cloudiest (excluding near-zero days, which are
+more likely a sensor outage than genuine weather — even heavy overcast yields
+some diffuse light), the most price-volatile, and the one closest to a
+typical day by total generation.
+
+```{python}
+#| echo: false
+sim_with_date = sim.with_columns(pl.col("hour").dt.date().alias("date"))
+
+daily_stats = (
+    sim_with_date.group_by("date")
+    .agg(
+        pl.len().alias("n_hours"),
+        pl.col("generation_kwh").sum().alias("daily_generation_kwh"),
+        pl.col("price_eur_mwh").std().alias("price_volatility"),
+    )
+    .filter(pl.col("n_hours") == 24)  # exclude partial days at the data boundary
+)
+
+sunny = daily_stats.sort("daily_generation_kwh", descending=True).row(0, named=True)
+cloudy = (
+    daily_stats.filter(pl.col("daily_generation_kwh") > 1.0)
+    .sort("daily_generation_kwh")
+    .row(0, named=True)
+)
+volatile = daily_stats.sort("price_volatility", descending=True).row(0, named=True)
+_median_gen = daily_stats["daily_generation_kwh"].median()
+typical = (
+    daily_stats.with_columns((pl.col("daily_generation_kwh") - _median_gen).abs().alias("d"))
+    .sort("d")
+    .row(0, named=True)
+)
+
+picks = {
+    "Sunny day (peak solar)": sunny["date"],
+    "Cloudy day (low solar)": cloudy["date"],
+    "Volatile price day": volatile["date"],
+    "Typical day": typical["date"],
+}
+label_lookup = pl.DataFrame(
+    {
+        "date": list(picks.values()),
+        "day_label": [f"{d} — {desc}" for desc, d in picks.items()],
+    }
+)
+label_lookup
+```
+
+The battery's state of charge on any given day depends on its entire history,
+so each candidate size is simulated across the **full multi-year series**
+(not just the four days below) — the four days are then sliced back out for
+charting, keeping the embedded dataset small while keeping the SoC trace
+correct.
+
+```{python}
+#| echo: false
+_gens = sim_with_date["generation_kwh"].to_list()
+_loads = sim_with_date["load_kwh"].to_list()
+_selected_dates = label_lookup["date"].to_list()
+
+day_frame = pl.concat(
+    [
+        sim_with_date.with_columns(
+            pl.Series("soc_kwh", socs),
+            pl.Series("self_consumption_kwh", self_c),
+            pl.Series("battery_charge_kwh", charge),
+            pl.Series("battery_discharge_kwh", discharge),
+            pl.Series("grid_purchase_kwh", grid),
+            pl.Series("export_kwh", export),
+            pl.lit(b).alias("battery_kwh"),
+        ).filter(pl.col("date").is_in(_selected_dates))
+        for b in BATTERY_SIZES_KWH
+        for socs, self_c, charge, discharge, grid, export in [
+            simulate_battery_trace(float(b), _gens, _loads)
+        ]
+    ]
+).join(label_lookup, on="date", how="inner")
+
+usage_long = day_frame.unpivot(
+    index=["day_label", "battery_kwh", "hour_of_day"],
+    on=["self_consumption_kwh", "battery_discharge_kwh", "grid_purchase_kwh"],
+    variable_name="source",
+    value_name="kwh",
+).with_columns(
+    pl.col("source").replace(
+        {
+            "self_consumption_kwh": "Own use — direct solar",
+            "battery_discharge_kwh": "Own use — from battery",
+            "grid_purchase_kwh": "Bought from grid",
+        }
+    )
+)
+```
+
+```{python}
+#| echo: false
+_MAX_BATTERY_KWH = max(BATTERY_SIZES_KWH)
+_filter_expr = "datum.day_label == selected_day && datum.battery_kwh == selected_battery_kwh"
+
+day_param = alt.param(
+    name="selected_day",
+    value=label_lookup.filter(pl.col("date") == sunny["date"])["day_label"][0],
+    bind=alt.binding_select(options=label_lookup["day_label"].to_list(), name="Example day: "),
+)
+battery_param = alt.param(
+    name="selected_battery_kwh",
+    value=5,
+    bind=alt.binding_range(
+        min=0, max=_MAX_BATTERY_KWH, step=1, name="Battery size (kWh): "
+    ),
+)
+
+soc_chart = (
+    alt.Chart(day_frame)
+    .transform_filter(_filter_expr)
+    .mark_area(color="#4C78A8", opacity=0.6, line={"color": "#4C78A8"})
+    .encode(
+        x=alt.X("hour_of_day:O", title="Hour of day"),
+        y=alt.Y(
+            "soc_kwh:Q",
+            title="Battery SoC (kWh)",
+            scale=alt.Scale(domain=[0, _MAX_BATTERY_KWH]),
+        ),
+        tooltip=[
+            alt.Tooltip("hour_of_day:O", title="Hour"),
+            alt.Tooltip("soc_kwh:Q", title="SoC (kWh)", format=".2f"),
+        ],
+    )
+    .properties(width="container", height=160)
+)
+
+usage_chart = (
+    alt.Chart(usage_long)
+    .transform_filter(_filter_expr)
+    .mark_bar()
+    .encode(
+        x=alt.X("hour_of_day:O", title="Hour of day"),
+        y=alt.Y("kwh:Q", title="Electricity serving load (kWh)"),
+        color=alt.Color(
+            "source:N",
+            title=None,
+            scale=alt.Scale(
+                domain=["Own use — direct solar", "Own use — from battery", "Bought from grid"],
+                range=["#54A24B", "#4C78A8", "#E45756"],
+            ),
+        ),
+        order=alt.Order("source:N"),
+        tooltip=[
+            alt.Tooltip("hour_of_day:O", title="Hour"),
+            alt.Tooltip("source:N", title="Source"),
+            alt.Tooltip("kwh:Q", title="kWh", format=".2f"),
+        ],
+    )
+    .properties(width="container", height=220)
+)
+
+(soc_chart & usage_chart).add_params(day_param, battery_param)
+```
+
+At the default 5 kWh, the battery fills by early afternoon on the sunny day
+and then covers most of the evening's demand, leaving only a small grid
+purchase overnight. Drag the size to 0 kWh to see the no-battery baseline —
+every non-solar hour bought from the grid — or up to 15 kWh to see how much
+of the sunny day's export could theoretically be captured with more storage
+(with rapidly diminishing returns, matching the savings curve above).
+
+On the cloudy day there's barely enough generation to charge any battery
+size, so almost every hour is bought from the grid regardless of the slider.
+
+The volatile-price day turns out to sit inside a week-long *Dunkelflaute*
+(dark lull) — generation had already been scarce for days before the price
+spiked past €900/MWh, so even a large battery had almost nothing left to give
+exactly when it would have been most valuable. A battery that only charges
+from solar surplus can't arbitrage a price spike it never got the chance to
+prepare for.
+
+## Why timing matters — the midday price dip
+
+Germany-wide PV output depresses the day-ahead price around midday — the
+"duck curve" effect. One representative June week:
+
+```{python}
+#| echo: false
+week = sim.filter(
+    (pl.col("hour") >= pl.datetime(2025, 6, 16)) & (pl.col("hour") < pl.datetime(2025, 6, 23))
+)
+
+base_week = alt.Chart(week).encode(x=alt.X("hour:T", title="Hour"))
+
+gen_line = base_week.mark_area(opacity=0.4, color="#F2C94C").encode(
+    y=alt.Y("generation_kwh:Q", title="PV generation (kWh)"),
+    tooltip=[
+        alt.Tooltip("hour:T", title="Hour", format="%a %d %b %H:%M"),
+        alt.Tooltip("generation_kwh:Q", title="Generation (kWh)", format=".2f"),
+    ],
+)
+price_line = base_week.mark_line(color="#4C78A8", strokeWidth=2).encode(
+    y=alt.Y("price_eur_mwh:Q", title="Day-ahead price (€/MWh)"),
+    tooltip=[
+        alt.Tooltip("hour:T", title="Hour", format="%a %d %b %H:%M"),
+        alt.Tooltip("price_eur_mwh:Q", title="Price (€/MWh)", format=".1f"),
+    ],
+)
+
+alt.layer(gen_line, price_line).resolve_scale(y="independent").properties(
+    width="container", height=280
+).configure_view(strokeWidth=0)
+```
+
+As printed above, generation and the spot price correlate negatively across
+the full window — solar output and price move in opposite directions often
+enough that *when* a battery buys and sells matters, not just how much it
+can hold.
+
+## Caveats
+
+- **Proxy weather station**: Munich has no DWD radiation station; this uses
+  Weihenstephan-Dürnast, ~30 km north.
+- **Fixed system size**: 8 kWp / 4,000 kWh load are constants, not sliders —
+  the battery simulation is sequential (state-of-charge is path-dependent) and
+  can't be recomputed live in the browser, so they're fixed to keep the three
+  economic sliders above valid.
+- **Synthetic load profile**: a fixed diurnal shape, not a real smart-meter
+  reading — no weekday/weekend or seasonal variation.
+- **Feed-in tariff applies only to residual export**: the model prices only
+  the surplus the battery can't absorb at the statutory FIT, not total
+  generation — full-generation spot-market sale isn't representative of real
+  German residential PV economics.
+- **Solar-only charging**: the battery only ever charges from PV surplus, never
+  from cheap grid power — a real dynamic-tariff battery could also arbitrage
+  by buying at low overnight prices, which would help precisely during events
+  like the Dunkelflaute above.
+- **Whole-kWh battery sizes only**: the day-by-day walkthrough precomputes
+  0–15 kWh in 1 kWh steps (matching the sweep above) since each size needs its
+  own full sequential simulation — intermediate sizes aren't selectable.
