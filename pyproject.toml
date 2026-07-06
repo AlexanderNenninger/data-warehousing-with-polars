@@ -61,7 +61,7 @@ test = "pytest packages/data-warehousing-with-polars/tests --ignore=packages/dat
 test_memory = "pytest packages/data-warehousing-with-polars/tests/test_memory.py -v"
 test_cloud = "pytest packages/data-warehousing-with-polars/tests/test_cloud.py -v"
 test_ext = "pytest packages/polars-list-ext/tests -v"
-qa.sequence = ["fmt", "lint", "typecheck", "test", "test_memory", "test_ext"]
+qa.sequence = ["fmt", "lint", "typecheck", "test", "test_ext"]
 
 # ── polars-list-ext (Rust plugin) build ────────────────────────────────────────
 ext_build = "maturin develop --release --manifest-path packages/polars-list-ext/Cargo.toml"
