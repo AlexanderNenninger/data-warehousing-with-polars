@@ -19,8 +19,3 @@ polars = { version = "0.46.0", features = [
     "dtype-i16",
 ] }
 polars-arrow = { version = "0.46.0" }
-realfft = "3.4.0"
-butterworth = "0.1.0"
-interp = "2.0.2"
-num-traits = "0.2.19"
-thiserror = "2.0.12"

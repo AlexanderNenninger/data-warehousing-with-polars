@@ -1,4 +1,3 @@
-use crate::util::list_f64_dtype;
 use polars::chunked_array::builder::AnonymousListBuilder;
 use polars::prelude::*;
 use pyo3_polars::derive::polars_expr;
@@ -7,6 +6,13 @@ use serde::Deserialize;
 use std::collections::HashMap;
 
 // ── Output type functions ────────────────────────────────────────────────────
+
+fn list_f64_dtype(input_fields: &[Field]) -> PolarsResult<Field> {
+    Ok(Field::new(
+        input_fields[0].name.clone(),
+        DataType::List(Box::new(DataType::Float64)),
+    ))
+}
 
 /// `List[T]` + `List[U]` → `List[Struct{first: T, second: U}]`
 fn zip_output_type(input_fields: &[Field]) -> PolarsResult<Field> {

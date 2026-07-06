@@ -79,22 +79,6 @@ reference:
       - incremental.Source
       - incremental.Batch
 
-  - title: "List Extensions: FFT"
-    desc: Fast Fourier Transform applied to Polars List columns
-    contents:
-      - list_ext.apply_fft
-      - list_ext.fft_freqs
-      - list_ext.fft_freqs_linspace
-
-  - title: "List Extensions: Operations"
-    desc: Element-wise and range-based operations on Polars List columns
-    contents:
-      - list_ext.operate_scalar_on_list
-      - list_ext.interpolate_columns
-      - list_ext.aggregate_list_col_elementwise
-      - list_ext.agg_of_range
-      - list_ext.mean_of_range
-
   - title: "List Extensions: Combinators"
     desc: Functional combinators for Polars List columns, available via the `list_ext` expression namespace
     contents:
