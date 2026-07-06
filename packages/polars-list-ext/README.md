@@ -1,18 +1,7 @@
 # polars-list-ext
 
-A Polars plugin providing utilities for working with `List`-type columns,
-with a focus on signal processing, feature extraction, and general-purpose
-functional combinators.
-
-> **Attribution.** The signal-processing and feature-extraction functions
-> (`apply_fft`, `fft_freqs`, `fft_freqs_linspace`, `agg_of_range`, `mean_of_range`,
-> `aggregate_list_col_elementwise`, `operate_scalar_on_list`, `interpolate_columns` —
-> i.e. `src/agg.rs`, `src/dsp.rs`, `src/feat.rs`, `src/op.rs`, `src/util.rs`, and
-> `src/dsp_util/`) are ported verbatim from
-> [`polars_list_utils`](https://github.com/dashdeckers/polars_list_utils) by
-> Travis Hammond (dashdeckers). The `list_ext` combinator namespace
-> (`src/combinators.rs`) is original to this repository. The import name is
-> `polars_list_ext`.
+A Polars plugin providing general-purpose functional combinators for working
+with `List`-type columns.
 
 By implementing these operations as a Polars plugin, they participate in query
 optimisation and parallelisation rather than falling back to Python-level loops
@@ -26,17 +15,13 @@ pip install polars-list-ext
 
 ## Usage
 
-Free functions are called directly; combinators are accessed through the
-`list_ext` expression namespace registered on import:
+Combinators are accessed through the `list_ext` expression namespace,
+registered on import:
 
 ```python
 import polars as pl
-import polars_list_ext as ple
+import polars_list_ext  # noqa: F401 — registers the namespace
 
-# Free function
-df.with_columns(ple.apply_fft("signal", sample_rate=1000).alias("spectrum"))
-
-# Namespace combinator
 df.with_columns(pl.col("a").list_ext.zip(pl.col("b")).alias("pairs"))
 df.with_columns(pl.col("pairs").list_ext.unzip().alias("u")).unnest("u")
 ```
@@ -44,31 +29,6 @@ df.with_columns(pl.col("pairs").list_ext.unzip().alias("u")).unnest("u")
 ---
 
 ## API Reference
-
-### Signal Processing
-
-| Function | Description |
-|---|---|
-| `apply_fft(col, sample_rate, ...)` | FFT with optional windowing, Butterworth filter, and normalisation |
-| `fft_freqs(n, sample_rate)` | Frequency axis for FFT bins (use with `pl.lit`) |
-| `fft_freqs_linspace(start, stop, n)` | Linearly spaced frequency vector (use with `pl.lit`) |
-
-### Feature Extraction
-
-| Function | Description |
-|---|---|
-| `agg_of_range(y, x, agg, x_min, x_max, ...)` | Aggregate y-values within an x-range |
-| `mean_of_range(y, x, x_min, x_max, ...)` | Mean of y-values within an x-range |
-| `aggregate_list_col_elementwise(col, list_size, agg)` | Column-wise elementwise aggregation in a GroupBy |
-
-### Arithmetic
-
-| Function | Description |
-|---|---|
-| `operate_scalar_on_list(list_col, scalar_col, op)` | Apply `add`/`sub`/`mul`/`div` of a scalar column to each list element |
-| `interpolate_columns(x_data, y_data, x_interp)` | Interpolate a new y-series at arbitrary x positions |
-
----
 
 ### Combinators — `pl.col(...).list_ext.*`
 

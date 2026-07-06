@@ -7,7 +7,7 @@ A [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/) monore
 | Package | Path | What it is |
 | --- | --- | --- |
 | [`data-warehousing-with-polars`](packages/data-warehousing-with-polars/) | `packages/data-warehousing-with-polars/` | Incremental data pipelines on Polars + [Delta Lake](https://delta.io): file tracking, deduplication, SCD semantics, schema validation, and table maintenance. Documented in detail below. |
-| [`polars-list-ext`](packages/polars-list-ext/) | `packages/polars-list-ext/` | A Rust Polars expression plugin for List-column signal processing and feature extraction (FFT, Butterworth filters, element-wise aggregation). See [its README](packages/polars-list-ext/README.md). |
+| [`polars-list-ext`](packages/polars-list-ext/) | `packages/polars-list-ext/` | A Rust Polars expression plugin providing functional combinators for List-type columns (zip/unzip, join, windowing, chunking, and more). See [its README](packages/polars-list-ext/README.md). |
 
 The two packages are independent — neither depends on the other.
 
@@ -349,17 +349,17 @@ def clean(lf: pl.LazyFrame) -> pl.LazyFrame:
 
 ## polars-list-ext
 
-The `polars-list-ext` package (import `polars_list_ext`) is a Rust [Polars plugin](https://docs.pola.rs/user-guide/plugins/) providing expressions for List-type columns — FFT, windowing, Butterworth filters, element-wise aggregation, interpolation, and range features. It is built and installed by `uv sync`.
+The `polars-list-ext` package (import `polars_list_ext`) is a Rust [Polars plugin](https://docs.pola.rs/user-guide/plugins/) providing functional combinators for List-type columns — zip/unzip, join, windowing, chunking, and more, via the `list_ext` expression namespace. It is built and installed by `uv sync`.
 
 ```python
 import polars as pl
-import polars_list_ext as ple
+import polars_list_ext  # noqa: F401 — registers the namespace
 
-df = pl.DataFrame({"signal": [[0.0, 1.0, 0.0, -1.0] * 4]})
-df.with_columns(ple.apply_fft("signal", sample_rate=16).alias("fft"))
+df = pl.DataFrame({"a": [[1, 2, 3]], "b": [[4, 5, 6]]})
+df.with_columns(pl.col("a").list_ext.zip(pl.col("b")).alias("pairs"))
 ```
 
-See the [package README](packages/polars-list-ext/README.md) for the full function list. It is derived from [`polars_list_utils`](https://github.com/dashdeckers/polars_list_utils) by Travis Hammond, modified for use here (attribution in its README).
+See the [package README](packages/polars-list-ext/README.md) for the full method list.
 
 ## Development
 
