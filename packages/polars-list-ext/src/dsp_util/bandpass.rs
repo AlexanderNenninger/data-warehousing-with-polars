@@ -1,3 +1,6 @@
+// Ported verbatim from polars_list_utils (https://github.com/dashdeckers/polars_list_utils)
+// by Travis Hammond (dashdeckers).
+
 use butterworth::{Cutoff, Filter};
 use thiserror::Error;
 

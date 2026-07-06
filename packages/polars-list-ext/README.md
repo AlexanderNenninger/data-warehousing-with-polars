@@ -4,10 +4,15 @@ A Polars plugin providing utilities for working with `List`-type columns,
 with a focus on signal processing, feature extraction, and general-purpose
 functional combinators.
 
-> **Attribution.** This package is derived from
+> **Attribution.** The signal-processing and feature-extraction functions
+> (`apply_fft`, `fft_freqs`, `fft_freqs_linspace`, `agg_of_range`, `mean_of_range`,
+> `aggregate_list_col_elementwise`, `operate_scalar_on_list`, `interpolate_columns` —
+> i.e. `src/agg.rs`, `src/dsp.rs`, `src/feat.rs`, `src/op.rs`, `src/util.rs`, and
+> `src/dsp_util/`) are ported verbatim from
 > [`polars_list_utils`](https://github.com/dashdeckers/polars_list_utils) by
-> Travis Hammond (dashdeckers), used under the terms of its original license and
-> modified for use in this repository. The import name is `polars_list_ext`.
+> Travis Hammond (dashdeckers). The `list_ext` combinator namespace
+> (`src/combinators.rs`) is original to this repository. The import name is
+> `polars_list_ext`.
 
 By implementing these operations as a Polars plugin, they participate in query
 optimisation and parallelisation rather than falling back to Python-level loops

@@ -1,3 +1,6 @@
+// Ported verbatim from polars_list_utils (https://github.com/dashdeckers/polars_list_utils)
+// by Travis Hammond (dashdeckers).
+
 use polars::{prelude::*, series::amortized_iter::AmortSeries};
 use pyo3_polars::export::polars_core::utils::align_chunks_binary;
 

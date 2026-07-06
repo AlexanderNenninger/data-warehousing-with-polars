@@ -1,3 +1,6 @@
+// Ported verbatim from polars_list_utils (https://github.com/dashdeckers/polars_list_utils)
+// by Travis Hammond (dashdeckers).
+
 use crate::util::binary_amortized_elementwise;
 use polars::{prelude::*, series::amortized_iter::AmortSeries};
 use pyo3_polars::derive::polars_expr;

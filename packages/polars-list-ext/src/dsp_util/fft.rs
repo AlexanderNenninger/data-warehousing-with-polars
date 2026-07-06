@@ -1,3 +1,6 @@
+// Ported verbatim from polars_list_utils (https://github.com/dashdeckers/polars_list_utils)
+// by Travis Hammond (dashdeckers).
+
 use crate::dsp_util::linspace;
 use pyo3::prelude::*;
 use realfft::RealFftPlanner;
