@@ -23,3 +23,5 @@ Cargo.lock
 
 # Quarto extensions
 _extensions/
+.DS_Store
+*.png
