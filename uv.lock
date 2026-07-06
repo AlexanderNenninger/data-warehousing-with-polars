@@ -533,7 +533,7 @@ dev = [
 
 [[package]]
 name = "data-warehousing-with-polars"
-version = "0.4.0"
+version = "0.4.1"
 source = { editable = "packages/data-warehousing-with-polars" }
 dependencies = [
     { name = "deltalake" },

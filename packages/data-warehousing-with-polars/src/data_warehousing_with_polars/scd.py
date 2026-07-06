@@ -73,6 +73,31 @@ def _partition_predicate(df: pl.DataFrame, partition_cols: list[str]) -> str | N
     return " AND ".join(clauses)
 
 
+def _align_join_dtypes(
+    lf: pl.LazyFrame, existing_schema: pl.Schema, cols: list[str]
+) -> pl.LazyFrame:
+    """Cast *lf*'s *cols* to match *existing_schema* wherever they differ.
+
+    A batch computed fresh by the caller's own code can end up in a different
+    dtype than what's actually persisted for the same logical column — most
+    commonly ``Datetime`` precision: Delta normalises stored timestamps to
+    microseconds on write regardless of what precision was written, but a
+    freshly recomputed batch keeps whatever precision the caller's own code
+    produces (e.g. milliseconds, matching an upstream API's native units).
+    Joining directly on such a column fails with a polars ``SchemaError``,
+    since join keys require an exact dtype match. Casting the incoming side
+    to the already-persisted dtype is safe — it doesn't change what's stored,
+    only reconciles this comparison to what's already on disk.
+    """
+    lf_schema = lf.collect_schema()
+    casts = [
+        pl.col(c).cast(existing_schema[c])
+        for c in cols
+        if c in existing_schema and c in lf_schema and existing_schema[c] != lf_schema[c]
+    ]
+    return lf.with_columns(casts) if casts else lf
+
+
 def _upsert_overwrite(
     target: str,
     df: pl.DataFrame,
@@ -105,8 +130,9 @@ def _upsert_overwrite(
         existing = pl.scan_delta(target)
         for col in partition_list:
             existing = existing.filter(pl.col(col).is_in(df[col].unique().to_list()))
-        keep = existing.join(df.lazy().select(join_cols), on=join_cols, how="anti")
-        merged = pl.concat([keep, df.lazy()], how="diagonal_relaxed")
+        new_lf = _align_join_dtypes(df.lazy(), existing.collect_schema(), join_cols)
+        keep = existing.join(new_lf.select(join_cols), on=join_cols, how="anti")
+        merged = pl.concat([keep, new_lf], how="diagonal_relaxed")
         merged.sink_delta(
             target,
             mode="overwrite",
@@ -119,8 +145,10 @@ def _upsert_overwrite(
         )
         return
 
-    keep = pl.scan_delta(target).join(df.lazy().select(join_cols), on=join_cols, how="anti")
-    merged = pl.concat([keep, df.lazy()], how="diagonal_relaxed")
+    existing = pl.scan_delta(target)
+    new_lf = _align_join_dtypes(df.lazy(), existing.collect_schema(), join_cols)
+    keep = existing.join(new_lf.select(join_cols), on=join_cols, how="anti")
+    merged = pl.concat([keep, new_lf], how="diagonal_relaxed")
     merged.sink_delta(
         target,
         mode="overwrite",
@@ -209,9 +237,16 @@ def _sink_scd2(
     to_close = pl.col("__match").fill_null(False) & pl.col("is_current")
     predicate = _partition_predicate(df, partition_list) if partition_list else None
 
+    # Both incoming's `keys` and lf_versioned's `dedup_cols` are computed fresh by
+    # this run and may not match the target's actual persisted dtypes (e.g.
+    # Datetime precision — see _align_join_dtypes) — align both to the target's
+    # schema once, up front, so every join below compares like-for-like.
+    target_schema = pl.scan_delta(target).collect_schema()
+    incoming_lf = _align_join_dtypes(incoming.lazy(), target_schema, keys)
+
     def _close(existing: pl.LazyFrame) -> pl.LazyFrame:
         return (
-            existing.join(incoming.lazy(), on=keys, how="left")
+            existing.join(incoming_lf, on=keys, how="left")
             .with_columns(
                 pl.when(to_close).then(pl.lit(now)).otherwise(pl.col("valid_to")).alias("valid_to"),
                 pl.when(to_close)
@@ -228,13 +263,14 @@ def _sink_scd2(
     # this commit — one scan of `existing` safely covers both the close-join and
     # this anti-join, rather than a second, separate scan later.
     dedup_cols = keys + ["valid_from"]
+    lf_versioned_aligned = _align_join_dtypes(lf_versioned, target_schema, dedup_cols)
 
     if predicate is not None:
         assert partition_list is not None
         existing = pl.scan_delta(target)
         for col in partition_list:
             existing = existing.filter(pl.col(col).is_in(df[col].unique().to_list()))
-        new_rows = lf_versioned.join(existing.select(dedup_cols), on=dedup_cols, how="anti")
+        new_rows = lf_versioned_aligned.join(existing.select(dedup_cols), on=dedup_cols, how="anti")
         pl.concat([_close(existing), new_rows], how="diagonal_relaxed").sink_delta(
             target,
             mode="overwrite",
@@ -247,7 +283,7 @@ def _sink_scd2(
         )
     else:
         existing = pl.scan_delta(target)
-        new_rows = lf_versioned.join(existing.select(dedup_cols), on=dedup_cols, how="anti")
+        new_rows = lf_versioned_aligned.join(existing.select(dedup_cols), on=dedup_cols, how="anti")
         pl.concat([_close(existing), new_rows], how="diagonal_relaxed").sink_delta(
             target,
             mode="overwrite",
@@ -313,10 +349,12 @@ def _sink_scd4(
     # Step 1: Archive current versions of affected records. The target is scanned
     # out-of-core via the streaming engine; the inner join against the batch's
     # distinct keys bounds the result to one row per incoming key.
-    incoming_keys = df.select(keys).unique()
+    existing_for_archive = pl.scan_delta(target)
+    incoming_keys = _align_join_dtypes(
+        df.select(keys).unique().lazy(), existing_for_archive.collect_schema(), keys
+    )
     _current = (
-        pl.scan_delta(target)
-        .join(incoming_keys.lazy(), on=keys, how="inner")
+        existing_for_archive.join(incoming_keys, on=keys, how="inner")
         .with_columns(pl.lit(now).alias("superseded_at"))
         .collect(engine="streaming")
     )

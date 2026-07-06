@@ -1,5 +1,6 @@
 """Tests for incremental module."""
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, cast
 
@@ -284,6 +285,79 @@ def test_merge_on_none():
     )
     def test_pipeline(lf: pl.LazyFrame) -> pl.LazyFrame:
         return lf
+
+
+def test_upsert_handles_join_key_dtype_mismatch(tmp_path: Path) -> None:
+    """Regression test: a batch computed with a coarser Datetime precision than
+    what's actually persisted must not crash the upsert's anti-join.
+
+    Delta normalises stored timestamps to microsecond precision on write
+    regardless of what was written, but a source's own ingestion code may
+    keep a coarser precision matching an upstream API's native units (e.g.
+    munich_solar.py casts SMARD's epoch-millisecond timestamps to
+    ``Datetime("ms")``). The second run's freshly-computed batch then has
+    ``ms`` precision while the already-written target reports ``us``,
+    and joining directly on the mismatched dtypes raised
+    ``polars.exceptions.SchemaError: datatypes of join keys don't match``.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+
+    def _write_batch(name: str, ts: datetime, value: float) -> None:
+        pl.DataFrame({"timestamp": [ts], "value": [value]}).with_columns(
+            pl.col("timestamp").cast(pl.Datetime("ms", "UTC"))
+        ).write_parquet(src / name)
+
+    _write_batch("00001.parquet", datetime(2025, 1, 1, tzinfo=timezone.utc), 50.0)
+
+    @incremental(
+        source=str(src),
+        target=str(tmp_path / "target"),
+        merge_on="timestamp",
+    )
+    def pipeline(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf
+
+    pipeline.run()  # first write: streaming create, no join involved
+
+    _write_batch("00002.parquet", datetime(2025, 1, 2, tzinfo=timezone.utc), 60.0)
+    pipeline.run()  # second write: exercises _upsert_overwrite's anti-join
+
+    result = cast(pl.DataFrame, pl.scan_delta(str(tmp_path / "target")).collect()).sort("timestamp")
+    assert result["value"].to_list() == [50.0, 60.0]
+
+
+def test_scd2_handles_merge_key_dtype_mismatch(tmp_path: Path) -> None:
+    """Same regression as test_upsert_handles_join_key_dtype_mismatch, for
+    SCD2's close-join and dedup anti-join.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+
+    def _write_batch(name: str, ts: datetime, state: str) -> None:
+        pl.DataFrame({"timestamp": [ts], "state": [state]}).with_columns(
+            pl.col("timestamp").cast(pl.Datetime("ms", "UTC"))
+        ).write_parquet(src / name)
+
+    _write_batch("00001.parquet", datetime(2025, 1, 1, tzinfo=timezone.utc), "a")
+
+    @incremental(
+        source=str(src),
+        target=str(tmp_path / "target"),
+        merge_on="timestamp",
+        scd_type=2,
+    )
+    def pipeline(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf
+
+    pipeline.run()  # first write: streaming create, no join involved
+
+    _write_batch("00002.parquet", datetime(2025, 1, 2, tzinfo=timezone.utc), "b")
+    pipeline.run()  # second write: exercises _sink_scd2's close + dedup joins
+
+    result = cast(pl.DataFrame, pl.scan_delta(str(tmp_path / "target")).collect()).sort("timestamp")
+    assert result["state"].to_list() == ["a", "b"]
+    assert result["is_current"].to_list() == [True, True]
 
 
 # ── Source protocol tests ─────────────────────────────────────────────────────
