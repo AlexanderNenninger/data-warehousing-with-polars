@@ -1,3 +1,6 @@
+// Ported verbatim from polars_list_utils (https://github.com/dashdeckers/polars_list_utils)
+// by Travis Hammond (dashdeckers).
+
 use crate::util::list_f64_dtype;
 use interp::{InterpMode, interp_slice};
 use polars::prelude::*;
