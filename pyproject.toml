@@ -61,6 +61,7 @@ typecheck = "ty check packages/data-warehousing-with-polars/src packages/polars-
 test = "pytest packages/data-warehousing-with-polars/tests --ignore=packages/data-warehousing-with-polars/tests/test_memory.py -v -m 'not slow'"
 test_memory = "pytest packages/data-warehousing-with-polars/tests/test_memory.py -v"
 test_cloud = "pytest packages/data-warehousing-with-polars/tests/test_cloud.py -v"
+test_concurrency = "pytest packages/data-warehousing-with-polars/tests/test_s3_concurrency.py -v"
 test_ext = "pytest packages/polars-list-ext/tests -v"
 qa.sequence = ["fmt", "lint", "typecheck", "test", "test_ext"]
 
