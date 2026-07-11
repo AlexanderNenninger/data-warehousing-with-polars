@@ -28,12 +28,13 @@ import json
 import sys
 from pathlib import Path
 
-# Make conftest and the installed package importable when run standalone.
-sys.path.insert(0, str(Path(__file__).parent))
+# Make project root importable for the ``incremental`` decorator and other helpers.
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import polars as pl  # noqa: E402
-from _memory_tools import _RSSMeasurement  # noqa
 from data_warehousing_with_polars.incremental import _DeltaCdfSource, incremental  # noqa: E402
+
+from utils.memory_tools import _RSSMeasurement
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
