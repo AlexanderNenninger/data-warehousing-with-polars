@@ -47,6 +47,21 @@ def run_id():
     return uuid.uuid4().hex[:8]
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _cleanup_s3_prefix(bucket, run_id):
+    """Recursively delete ``s3://{bucket}/tests/{run_id}`` once every test in this
+    module has run, regardless of outcome — otherwise every invocation leaves its
+    source/staging/delta artifacts behind in the bucket permanently."""
+    yield
+    from pyarrow import fs as pa_fs
+
+    filesystem, base_path = pa_fs.FileSystem.from_uri(f"s3://{bucket}/tests/{run_id}")
+    try:
+        filesystem.delete_dir(base_path)
+    except FileNotFoundError:
+        pass
+
+
 @pytest.mark.slow
 def test_incremental_remote_append(ctx, bucket, run_id):
     """@incremental with compute_context executes the transform on the cluster
