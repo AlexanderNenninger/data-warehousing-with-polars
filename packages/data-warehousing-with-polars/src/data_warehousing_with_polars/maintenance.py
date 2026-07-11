@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 _RUNS_SUFFIX = "/_runs"
 
 
-def _load_run_count(store: str) -> int:
+def _load_run_count(store: str, storage_options: dict[str, str] | None = None) -> int:
     """Return the current run count from the watermark table.
 
     Used by the ``compact_every`` trigger to determine whether compaction
@@ -42,7 +42,8 @@ def _load_run_count(store: str) -> int:
     run-count sub-table at ``<store>/_runs``.
 
     Args:
-        store: Local path to the watermark Delta table.
+        store: Local or cloud path to the watermark Delta table.
+        storage_options: Forwarded to ``pl.scan_delta`` — see :func:`maintain`.
 
     Returns:
         The current run count, or ``0`` if no count has been recorded yet.
@@ -50,7 +51,10 @@ def _load_run_count(store: str) -> int:
     runs_store = store.rstrip("/") + _RUNS_SUFFIX
     try:
         result = cast(
-            pl.DataFrame, pl.scan_delta(runs_store).select(pl.col("run_count").max()).collect()
+            pl.DataFrame,
+            pl.scan_delta(runs_store, storage_options=storage_options)
+            .select(pl.col("run_count").max())
+            .collect(),
         )
         val = result["run_count"][0]
         return int(val) if val is not None else 0
@@ -58,12 +62,13 @@ def _load_run_count(store: str) -> int:
         return 0
 
 
-def _save_run_count(store: str, count: int) -> None:
+def _save_run_count(store: str, count: int, storage_options: dict[str, str] | None = None) -> None:
     """Append the updated run count to the watermark table.
 
     Args:
-        store:  Local path to the watermark Delta table.
+        store:  Local or cloud path to the watermark Delta table.
         count:  The new run count after a successful ``run()`` call.
+        storage_options: Forwarded to ``write_deltalake`` — see :func:`maintain`.
     """
     runs_store = store.rstrip("/") + _RUNS_SUFFIX
     rows = pl.DataFrame(
@@ -72,7 +77,7 @@ def _save_run_count(store: str, count: int) -> None:
             "updated_at": [datetime.now(timezone.utc)],
         }
     )
-    write_deltalake(runs_store, rows, mode="append")
+    write_deltalake(runs_store, rows, mode="append", storage_options=storage_options)
 
 
 def maintain(
@@ -81,6 +86,7 @@ def maintain(
     z_order_by: str | list[str] | None = None,
     vacuum: bool = True,
     retention_hours: int = 168,
+    storage_options: dict[str, str] | None = None,
 ) -> None:
     """Compact and/or vacuum a Delta table.
 
@@ -96,7 +102,7 @@ def maintain(
     scheduled less frequently (weekly rather than after every batch of runs).
 
     Args:
-        target:          Local path to the Delta table to maintain.
+        target:          Local or cloud path to the Delta table to maintain.
         compact:         Coalesce small files. Ignored when ``z_order_by``
                          is set.
         z_order_by:      Column(s) to Z-order by after compaction. Runs
@@ -108,8 +114,12 @@ def maintain(
                          requires ``enforce_retention_duration=False`` on
                          the underlying Delta call, which should only be done
                          in development environments.
+        storage_options: Forwarded to the underlying ``DeltaTable`` — e.g. to
+                         raise ``object_store``'s S3 client timeouts on a
+                         slow/degrading connection (see ``incremental()``'s
+                         ``storage_options`` for the same knob on ingestion).
     """
-    dt = DeltaTable(target)
+    dt = DeltaTable(target, storage_options=storage_options)
 
     if z_order_by is not None:
         cols = [z_order_by] if isinstance(z_order_by, str) else list(z_order_by)

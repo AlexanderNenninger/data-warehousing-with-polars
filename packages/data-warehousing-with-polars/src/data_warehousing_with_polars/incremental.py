@@ -67,7 +67,7 @@ def _list_s3_files(source: str, suffixes: tuple[str, ...]) -> list[str]:
     )
 
 
-def _load_cursors(store: str) -> dict[int, object]:
+def _load_cursors(store: str, storage_options: dict[str, str] | None = None) -> dict[int, object]:
     """Return the per-slot cursors recorded in the watermark table.
 
     Returns ``{}`` on first run, or when the store holds an incompatible
@@ -76,7 +76,9 @@ def _load_cursors(store: str) -> dict[int, object]:
     try:
         result = cast(
             pl.DataFrame,
-            pl.scan_delta(store).select("slot", "cursor_json").collect(),
+            pl.scan_delta(store, storage_options=storage_options)
+            .select("slot", "cursor_json")
+            .collect(),
         )
         return {
             int(row["slot"]): json.loads(row["cursor_json"]) for row in result.iter_rows(named=True)
@@ -85,7 +87,9 @@ def _load_cursors(store: str) -> dict[int, object]:
         return {}
 
 
-def _save_cursors(store: str, cursors: dict[int, object]) -> None:
+def _save_cursors(
+    store: str, cursors: dict[int, object], storage_options: dict[str, str] | None = None
+) -> None:
     """Overwrite the watermark table with one row per slot cursor."""
     slots = sorted(cursors)
     now = datetime.now(timezone.utc)
@@ -96,7 +100,9 @@ def _save_cursors(store: str, cursors: dict[int, object]) -> None:
             "saved_at": [now] * len(slots),
         }
     )
-    write_deltalake(store, rows, mode="overwrite", schema_mode="overwrite")
+    write_deltalake(
+        store, rows, mode="overwrite", schema_mode="overwrite", storage_options=storage_options
+    )
 
 
 def _scan_files(
@@ -138,13 +144,14 @@ def _partition_list(partition_by: str | list[str] | None) -> list[str] | None:
 def _read_delta_source(
     source: str,
     from_version: int | None,
+    storage_options: dict[str, str] | None = None,
 ) -> tuple[pl.LazyFrame, int]:
     """Return ``(lf, current_version)`` from *source* via CDF, or full scan on first run."""
-    dt = DeltaTable(source)
+    dt = DeltaTable(source, storage_options=storage_options)
     current_version = dt.version()
 
     if from_version is None:
-        return pl.scan_delta(source), current_version
+        return pl.scan_delta(source, storage_options=storage_options), current_version
 
     reader = dt.load_cdf(
         starting_version=from_version + 1,
@@ -165,6 +172,7 @@ def _sink_target(
     partition_by: str | list[str] | None = None,
     commit_properties: CommitProperties | None = None,
     creation_lock: threading.Lock | None = None,
+    storage_options: dict[str, str] | None = None,
 ) -> None:
     """Write *lf* to *target*: append when ``merge_on`` is ``None``, upsert otherwise.
 
@@ -176,6 +184,12 @@ def _sink_target(
     ordinary data commits, table creation is not something delta-rs's optimistic-concurrency
     retry can safely resolve on its own. Once the table exists, concurrent writes proceed
     unlocked, relying on delta-rs's normal conditional-PUT-based conflict resolution.
+
+    *storage_options* is forwarded to every ``sink_delta`` call — e.g. ``{"timeout":
+    "600s", "connect_timeout": "60s"}`` to raise object_store's default ~180s total
+    retry budget for a large write over a slow/degrading connection, where the
+    default gives up mid-multipart-upload even though the transfer is still
+    making progress.
     """
     keys = [merge_on] if isinstance(merge_on, str) else (list(merge_on) if merge_on else [])
     partition_list = (
@@ -188,7 +202,7 @@ def _sink_target(
     with guard:
         first_write = False
         try:
-            DeltaTable(target)
+            DeltaTable(target, storage_options=storage_options)
         except TableNotFoundError:
             first_write = True
 
@@ -199,6 +213,7 @@ def _sink_target(
             lf.sink_delta(
                 target,
                 mode="overwrite",
+                storage_options=storage_options,
                 delta_write_options={
                     "configuration": _CDF_CONFIG,
                     "partition_by": partition_list,
@@ -213,7 +228,10 @@ def _sink_target(
     if not keys:
         # Streaming append: data flows chunk-by-chunk without full materialisation.
         lf.sink_delta(
-            target, mode="append", delta_write_options={"commit_properties": commit_properties}
+            target,
+            mode="append",
+            storage_options=storage_options,
+            delta_write_options={"commit_properties": commit_properties},
         )
         return
 
@@ -223,7 +241,14 @@ def _sink_target(
     # which delta-rs 1.6 executes unreliably on S3 targets at scale. Match on the same
     # columns the MERGE predicate used: merge keys plus any partition columns.
     join_cols = keys + (partition_list or [])
-    _upsert_overwrite(target, _df, join_cols, partition_list, commit_properties=commit_properties)
+    _upsert_overwrite(
+        target,
+        _df,
+        join_cols,
+        partition_list,
+        commit_properties=commit_properties,
+        storage_options=storage_options,
+    )
 
 
 # ── Source protocol and built-in implementations ──────────────────────────────
@@ -358,15 +383,20 @@ class _DeltaCdfSource:
     table; later polls read only the Change Data Feed since the stored version.
     """
 
-    def __init__(self, source_path: str) -> None:
+    def __init__(self, source_path: str, storage_options: dict[str, str] | None = None) -> None:
         self._source_path = source_path
+        self._storage_options = storage_options
 
     def poll(self, since: object | None) -> Batch | None:
         from_version = int(since) if isinstance(since, int) else None
-        current_version = DeltaTable(self._source_path).version()
+        current_version = DeltaTable(
+            self._source_path, storage_options=self._storage_options
+        ).version()
         if from_version is not None and from_version >= current_version:
             return None
-        frame, current_version = _read_delta_source(self._source_path, from_version)
+        frame, current_version = _read_delta_source(
+            self._source_path, from_version, storage_options=self._storage_options
+        )
         return Batch(frame=frame, cursor=current_version)
 
 
@@ -436,6 +466,7 @@ def incremental(
     reader_kwargs: dict | None = None,
     by_partition: bool = False,
     by_partition_workers: int = 4,
+    storage_options: dict[str, str] | None = None,
 ) -> Callable:
     """Wrap a ``LazyFrame → LazyFrame`` function as an :class:`IncrementalPipeline`.
 
@@ -494,6 +525,17 @@ def incremental(
                          local filesystems, atomic exclusive commit-file creation does the
                          same with no configuration needed either way. The pipeline scales
                          delta-rs's commit-retry budget to match this worker count.
+        storage_options: Forwarded consistently to every Delta read/write this
+                         pipeline performs against a cloud target — the watermark,
+                         pipeline-version marker, ``compact_every`` maintenance, the
+                         sink itself (every ``scd_type``, including
+                         ``compute_context`` remote writes), and Delta-CDF sources.
+                         Useful for raising ``object_store``'s S3 client timeouts
+                         (e.g. ``{"timeout": "600s", "connect_timeout": "60s"}``) on
+                         a slow/degrading connection, where the ~180s default total
+                         retry budget gives up mid-multipart-upload even though the
+                         transfer is still making progress. See the `object_store S3 config keys
+                         <https://docs.rs/object_store/latest/object_store/aws/enum.AmazonS3ConfigKey.html#variants>`__.
 
     Examples:
         Basic upsert — process new Parquet files and merge on ``id``::
@@ -613,6 +655,7 @@ def incremental(
             reader_kwargs=reader_kwargs,
             by_partition=by_partition,
             by_partition_workers=by_partition_workers,
+            storage_options=storage_options,
         )
 
     return decorator
@@ -664,6 +707,7 @@ class IncrementalPipeline:
         by_partition: bool = False,
         by_partition_workers: int = 4,
         fail_on_version_mismatch: bool = False,
+        storage_options: dict[str, str] | None = None,
     ) -> None:
         """Validate config and set attributes.
 
@@ -698,6 +742,7 @@ class IncrementalPipeline:
         self.by_partition = by_partition
         self.by_partition_workers = by_partition_workers
         self.fail_on_version_mismatch = fail_on_version_mismatch
+        self.storage_options = storage_options
 
         # Normalize every source — directory, Delta table, or custom Source —
         # into a uniform list of Source adapters so all source types fan in.
@@ -708,7 +753,7 @@ class IncrementalPipeline:
             if isinstance(item, Source):
                 return item
             if file_format == "delta":
-                return _DeltaCdfSource(item)
+                return _DeltaCdfSource(item, storage_options=self.storage_options)
             return _DirSource(item, file_format, suffixes, reader_kwargs)
 
         items = cast("list[str | Source]", source if isinstance(source, list) else [source])
@@ -770,7 +815,7 @@ class IncrementalPipeline:
             ``fail_on_version_mismatch`` setting supplied to
             :func:`incremental`.
         """
-        cursors = _load_cursors(self.watermark_store)
+        cursors = _load_cursors(self.watermark_store, storage_options=self.storage_options)
         batches: list[tuple[int, Batch]] = []
         for i, src in enumerate(self._sources):
             batch = src.poll(cursors.get(i))
@@ -814,7 +859,7 @@ class IncrementalPipeline:
             self._dispatch_sink(result_lf)
 
         new_cursors = {**cursors, **{i: b.cursor for i, b in batches}}
-        _save_cursors(self.watermark_store, new_cursors)
+        _save_cursors(self.watermark_store, new_cursors, storage_options=self.storage_options)
 
         # Persist pipeline version info alongside watermark.
         try:
@@ -823,10 +868,10 @@ class IncrementalPipeline:
             logger.exception("Failed to persist pipeline version.")
 
         if self.compact_every is not None:
-            count = _load_run_count(self.watermark_store) + 1
-            _save_run_count(self.watermark_store, count)
+            count = _load_run_count(self.watermark_store, storage_options=self.storage_options) + 1
+            _save_run_count(self.watermark_store, count, storage_options=self.storage_options)
             if count % self.compact_every == 0:
-                maintain(self.target)
+                maintain(self.target, storage_options=self.storage_options)
 
         logger.info("Processed %d source(s).", len(batches))
         return labels
@@ -847,6 +892,7 @@ class IncrementalPipeline:
                 self.merge_on,
                 self.compute_context,
                 self.partition_by,
+                storage_options=self.storage_options,
             )
         elif self.scd_type == 2:
             assert self.merge_on is not None, "merge_on is required for scd_type=2"
@@ -857,6 +903,7 @@ class IncrementalPipeline:
                 self.partition_by,
                 commit_properties=commit_properties,
                 creation_lock=creation_lock,
+                storage_options=self.storage_options,
             )
         elif self.scd_type == 4:
             assert self.merge_on is not None, "merge_on is required for scd_type=4"
@@ -869,6 +916,7 @@ class IncrementalPipeline:
                 self.partition_by,
                 commit_properties=commit_properties,
                 creation_lock=creation_lock,
+                storage_options=self.storage_options,
             )
         else:
             _sink_target(
@@ -878,6 +926,7 @@ class IncrementalPipeline:
                 self.partition_by,
                 commit_properties=commit_properties,
                 creation_lock=creation_lock,
+                storage_options=self.storage_options,
             )
 
     def _process_partition_combo(
@@ -950,10 +999,12 @@ class IncrementalPipeline:
                 single_use = isinstance(src, _DeltaCdfSource) and cursors.get(i) is not None
                 if single_use:
                     cdf_src = cast(_DeltaCdfSource, src)
-                    dt = DeltaTable(cdf_src._source_path)
+                    dt = DeltaTable(cdf_src._source_path, storage_options=cdf_src._storage_options)
                     from_version = cast(int, cursors[i])
                     ending_version = cast(int, batch.cursor)
-                    schema = pl.scan_delta(cdf_src._source_path).collect_schema()
+                    schema = pl.scan_delta(
+                        cdf_src._source_path, storage_options=cdf_src._storage_options
+                    ).collect_schema()
 
                     def _cdf_combo_lf(
                         combo: dict[str, object],
@@ -992,7 +1043,9 @@ class IncrementalPipeline:
                     enum_frames[i] = batch.frame
             elif isinstance(src, _DeltaCdfSource):
                 # Idle Delta source: schema is available from the transaction log.
-                idle_lf = pl.scan_delta(src._source_path).head(0)
+                idle_lf = pl.scan_delta(
+                    src._source_path, storage_options=src._storage_options
+                ).head(0)
                 resolved[i] = idle_lf
                 enum_frames[i] = idle_lf
             # Other idle source types: omitted (schema unknowable without reading data).
@@ -1031,7 +1084,7 @@ class IncrementalPipeline:
     def reset(self) -> None:
         """Delete all watermark rows so the next ``run()`` reprocesses all files."""
         try:
-            dt = DeltaTable(self.watermark_store)
+            dt = DeltaTable(self.watermark_store, storage_options=self.storage_options)
             dt.delete()
             logger.info("Watermark cleared.")
         except Exception:
@@ -1039,7 +1092,10 @@ class IncrementalPipeline:
 
     def status(self) -> pl.DataFrame:
         """Return the watermark table as an eager DataFrame."""
-        result = cast(pl.DataFrame, pl.scan_delta(self.watermark_store).collect())
+        result = cast(
+            pl.DataFrame,
+            pl.scan_delta(self.watermark_store, storage_options=self.storage_options).collect(),
+        )
         return result
 
     def maintain(
@@ -1059,6 +1115,7 @@ class IncrementalPipeline:
             z_order_by=z_order_by,
             vacuum=vacuum,
             retention_hours=retention_hours,
+            storage_options=self.storage_options,
         )
 
     # ---------------------
@@ -1073,11 +1130,17 @@ class IncrementalPipeline:
         path = self._pipeline_version_path()
         df = pl.DataFrame({"pipeline_hash": [self.pipeline_hash]})
         # Use write_deltalake and overwrite any previous value.
-        write_deltalake(path, df.to_arrow(), mode="overwrite", schema_mode="overwrite")
+        write_deltalake(
+            path,
+            df.to_arrow(),
+            mode="overwrite",
+            schema_mode="overwrite",
+            storage_options=self.storage_options,
+        )
 
     def _load_pipeline_version(self) -> str | None:
         try:
-            dt = DeltaTable(self._pipeline_version_path())
+            dt = DeltaTable(self._pipeline_version_path(), storage_options=self.storage_options)
             tbl = dt.to_pyarrow_table()
             df = pl.from_arrow(tbl)
             # Ensure a DataFrame (pyarrow may produce a Series for single-column tables)

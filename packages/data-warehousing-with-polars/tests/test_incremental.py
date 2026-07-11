@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, cast
+from unittest.mock import Mock
 
 import polars as pl
 import pytest
@@ -891,3 +892,119 @@ def test_by_partition_worker_error_propagates_and_watermark_unchanged(tmp_path: 
 
     with pytest.raises(Exception):  # noqa: B017 - no watermark table was ever committed
         pipe.status()
+
+
+# ── storage_options threaded consistently across every Delta touchpoint ────────
+
+
+def test_storage_options_stored_on_pipeline(tmp_path):
+    """`storage_options` is stored and reaches every source, not just the sink."""
+    opts = {"timeout": "600s", "connect_timeout": "60s"}
+
+    @incremental(
+        source=str(tmp_path / "input"),
+        target=str(tmp_path / "output"),
+        merge_on="id",
+        storage_options=opts,
+    )
+    def pipeline(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf
+
+    assert pipeline.storage_options == opts
+
+
+def test_delta_cdf_source_stores_storage_options():
+    """A Delta-formatted source gets the pipeline's storage_options, not just the sink."""
+
+    @incremental(
+        source="s3://bucket/source",
+        target="s3://bucket/target",
+        file_format="delta",
+        merge_on="id",
+        storage_options={"timeout": "600s"},
+    )
+    def pipeline(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf
+
+    assert isinstance(pipeline._sources[0], _DeltaCdfSource)
+    assert pipeline._sources[0]._storage_options == {"timeout": "600s"}
+
+
+def test_storage_options_default_scd1_end_to_end(tmp_path):
+    """An empty storage_options dict (harmless for local targets) doesn't break the
+    default append/upsert path: write, rerun, status, and maintain all still work."""
+    src = tmp_path / "input"
+    src.mkdir()
+    pl.DataFrame({"id": [1, 2], "value": [10.0, 20.0]}).write_parquet(src / "batch1.parquet")
+
+    @incremental(
+        source=str(src),
+        target=str(tmp_path / "output"),
+        merge_on="id",
+        storage_options={},
+    )
+    def pipeline(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf
+
+    processed = pipeline.run()
+    assert len(processed) == 1
+    assert pipeline.run() == []  # rerun: nothing new
+
+    result = pl.read_delta(str(tmp_path / "output")).sort("id")
+    assert result["id"].to_list() == [1, 2]
+
+    pipeline.status()  # watermark read must accept storage_options too
+    pipeline.maintain()  # compaction/vacuum must accept storage_options too
+
+
+def test_storage_options_scd_type_2_end_to_end(tmp_path):
+    """The scd_type=2 sink path (previously not wired to storage_options) still works."""
+    src = tmp_path / "input"
+    src.mkdir()
+    pl.DataFrame({"id": [1, 2], "value": [10.0, 20.0]}).write_parquet(src / "batch1.parquet")
+
+    @incremental(
+        source=str(src),
+        target=str(tmp_path / "output"),
+        merge_on="id",
+        scd_type=2,
+        storage_options={},
+    )
+    def pipeline(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf
+
+    pipeline.run()
+    result = pl.read_delta(str(tmp_path / "output")).sort("id")
+    assert result["id"].to_list() == [1, 2]
+    assert result["is_current"].to_list() == [True, True]
+
+
+def test_storage_options_threaded_through_remote_sink(tmp_path, monkeypatch):
+    """`_sink_target_remote` (the compute_context/Polars Cloud path) also threads
+    storage_options through — without needing a real cluster: only the
+    ``lf.remote(context).execute()`` boundary is faked, so the Delta write itself
+    (the part that actually needs storage_options) runs for real against tmp_path.
+    """
+    import polars_cloud as pc
+    from data_warehousing_with_polars.cloud import _sink_target_remote
+
+    df = pl.DataFrame({"id": [1, 2], "value": [10.0, 20.0]})
+
+    class _FakeQueryResult:
+        def lazy(self) -> pl.LazyFrame:
+            return df.lazy()
+
+    class _FakeRemoteQuery:
+        def execute(self) -> _FakeQueryResult:
+            return _FakeQueryResult()
+
+    monkeypatch.setattr(pl.LazyFrame, "remote", lambda self, context: _FakeRemoteQuery())
+
+    context = Mock(spec=pc.ClientContext)
+    target = str(tmp_path / "target")
+
+    _sink_target_remote(target, df.lazy(), merge_on=None, context=context, storage_options={})
+
+    result = pl.read_delta(target).sort("id")
+    assert result["id"].to_list() == [1, 2]
+    assert result["value"].to_list() == [10.0, 20.0]

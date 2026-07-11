@@ -26,6 +26,7 @@ def _sink_target_remote(
     merge_on: str | list[str] | None,
     context: object,
     partition_by: str | list[str] | None = None,
+    storage_options: dict[str, str] | None = None,
 ) -> None:
     """Execute *lf* on a Polars Cloud cluster and merge the result into the Delta *target*.
 
@@ -38,6 +39,10 @@ def _sink_target_remote(
         merge_on:     Upsert key column(s), or ``None`` for append-only.
         context:      ``polars_cloud.ComputeContext`` specifying cluster hardware.
         partition_by: Partition column(s).
+        storage_options: Forwarded to every ``DeltaTable``/``sink_delta`` call against
+                         *target* — see ``incremental()``'s ``storage_options`` for why
+                         (raising ``object_store``'s S3 client timeouts on a
+                         slow/degrading connection).
     """
     import polars_cloud as pc
 
@@ -60,7 +65,7 @@ def _sink_target_remote(
 
     first_write = False
     try:
-        DeltaTable(target)
+        DeltaTable(target, storage_options=storage_options)
     except TableNotFoundError:
         first_write = True
 
@@ -70,10 +75,11 @@ def _sink_target_remote(
             result_lf.sink_delta(
                 target,
                 mode="overwrite",
+                storage_options=storage_options,
                 delta_write_options={"configuration": _CDF_CONFIG, "partition_by": partition_list},
             )
         else:
-            result_lf.sink_delta(target, mode="append")
+            result_lf.sink_delta(target, mode="append", storage_options=storage_options)
         return
 
     # Merge (upsert): stream from cluster temp storage using sink_delta(mode="merge").
@@ -83,6 +89,7 @@ def _sink_target_remote(
         result_lf.sink_delta(
             target,
             mode="overwrite",
+            storage_options=storage_options,
             delta_write_options={"configuration": _CDF_CONFIG, "partition_by": partition_list},
         )
         return
@@ -92,6 +99,7 @@ def _sink_target_remote(
         result_lf.sink_delta(
             target,
             mode="merge",
+            storage_options=storage_options,
             delta_merge_options={
                 "predicate": predicate,
                 "source_alias": "source",

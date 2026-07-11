@@ -104,6 +104,7 @@ def _upsert_overwrite(
     join_cols: list[str],
     partition_list: list[str] | None,
     commit_properties: CommitProperties | None = None,
+    storage_options: dict[str, str] | None = None,
 ) -> None:
     """Upsert *df* into *target* by rewriting only the affected data, avoiding ``MERGE``.
 
@@ -127,7 +128,7 @@ def _upsert_overwrite(
 
     if predicate is not None:
         assert partition_list is not None
-        existing = pl.scan_delta(target)
+        existing = pl.scan_delta(target, storage_options=storage_options)
         for col in partition_list:
             existing = existing.filter(pl.col(col).is_in(df[col].unique().to_list()))
         new_lf = _align_join_dtypes(df.lazy(), existing.collect_schema(), join_cols)
@@ -136,6 +137,7 @@ def _upsert_overwrite(
         merged.sink_delta(
             target,
             mode="overwrite",
+            storage_options=storage_options,
             delta_write_options={
                 "predicate": predicate,
                 "partition_by": partition_list,
@@ -145,13 +147,14 @@ def _upsert_overwrite(
         )
         return
 
-    existing = pl.scan_delta(target)
+    existing = pl.scan_delta(target, storage_options=storage_options)
     new_lf = _align_join_dtypes(df.lazy(), existing.collect_schema(), join_cols)
     keep = existing.join(new_lf.select(join_cols), on=join_cols, how="anti")
     merged = pl.concat([keep, new_lf], how="diagonal_relaxed")
     merged.sink_delta(
         target,
         mode="overwrite",
+        storage_options=storage_options,
         delta_write_options={
             "schema_mode": "overwrite",
             "configuration": _CDF_CONFIG,
@@ -169,6 +172,7 @@ def _sink_scd2(
     partition_by: str | list[str] | None = None,
     commit_properties: CommitProperties | None = None,
     creation_lock: threading.Lock | None = None,
+    storage_options: dict[str, str] | None = None,
 ) -> None:
     """Write *lf* to a SCD Type 2 table, closing old versions and appending new ones.
 
@@ -200,7 +204,8 @@ def _sink_scd2(
 
     with creation_lock or contextlib.nullcontext():
         try:
-            DeltaTable(target)  # existence probe; raises TableNotFoundError on first run
+            # existence probe; raises TableNotFoundError on first run
+            DeltaTable(target, storage_options=storage_options)
             table_exists = True
         except TableNotFoundError:
             table_exists = False
@@ -210,6 +215,7 @@ def _sink_scd2(
             lf_versioned.sink_delta(
                 target,
                 mode="overwrite",
+                storage_options=storage_options,
                 delta_write_options={
                     "configuration": _CDF_CONFIG,
                     "partition_by": partition_list,
@@ -241,7 +247,7 @@ def _sink_scd2(
     # this run and may not match the target's actual persisted dtypes (e.g.
     # Datetime precision — see _align_join_dtypes) — align both to the target's
     # schema once, up front, so every join below compares like-for-like.
-    target_schema = pl.scan_delta(target).collect_schema()
+    target_schema = pl.scan_delta(target, storage_options=storage_options).collect_schema()
     incoming_lf = _align_join_dtypes(incoming.lazy(), target_schema, keys)
 
     def _close(existing: pl.LazyFrame) -> pl.LazyFrame:
@@ -267,13 +273,14 @@ def _sink_scd2(
 
     if predicate is not None:
         assert partition_list is not None
-        existing = pl.scan_delta(target)
+        existing = pl.scan_delta(target, storage_options=storage_options)
         for col in partition_list:
             existing = existing.filter(pl.col(col).is_in(df[col].unique().to_list()))
         new_rows = lf_versioned_aligned.join(existing.select(dedup_cols), on=dedup_cols, how="anti")
         pl.concat([_close(existing), new_rows], how="diagonal_relaxed").sink_delta(
             target,
             mode="overwrite",
+            storage_options=storage_options,
             delta_write_options={
                 "predicate": predicate,
                 "partition_by": partition_list,
@@ -282,11 +289,12 @@ def _sink_scd2(
             },
         )
     else:
-        existing = pl.scan_delta(target)
+        existing = pl.scan_delta(target, storage_options=storage_options)
         new_rows = lf_versioned_aligned.join(existing.select(dedup_cols), on=dedup_cols, how="anti")
         pl.concat([_close(existing), new_rows], how="diagonal_relaxed").sink_delta(
             target,
             mode="overwrite",
+            storage_options=storage_options,
             delta_write_options={
                 "schema_mode": "overwrite",
                 "configuration": _CDF_CONFIG,
@@ -305,6 +313,7 @@ def _sink_scd4(
     partition_by: str | list[str] | None = None,
     commit_properties: CommitProperties | None = None,
     creation_lock: threading.Lock | None = None,
+    storage_options: dict[str, str] | None = None,
 ) -> None:
     """Write *lf* to a SCD Type 4 table pair.
 
@@ -323,7 +332,8 @@ def _sink_scd4(
 
     with creation_lock or contextlib.nullcontext():
         try:
-            DeltaTable(target)  # existence probe; raises TableNotFoundError on first run
+            # existence probe; raises TableNotFoundError on first run
+            DeltaTable(target, storage_options=storage_options)
             target_exists = True
         except TableNotFoundError:
             target_exists = False
@@ -333,6 +343,7 @@ def _sink_scd4(
             lf_dedup.sink_delta(
                 target,
                 mode="overwrite",
+                storage_options=storage_options,
                 delta_write_options={
                     "configuration": _CDF_CONFIG,
                     "partition_by": partition_list,
@@ -349,7 +360,7 @@ def _sink_scd4(
     # Step 1: Archive current versions of affected records. The target is scanned
     # out-of-core via the streaming engine; the inner join against the batch's
     # distinct keys bounds the result to one row per incoming key.
-    existing_for_archive = pl.scan_delta(target)
+    existing_for_archive = pl.scan_delta(target, storage_options=storage_options)
     incoming_keys = _align_join_dtypes(
         df.select(keys).unique().lazy(), existing_for_archive.collect_schema(), keys
     )
@@ -362,7 +373,7 @@ def _sink_scd4(
     if len(current) > 0:
         with creation_lock or contextlib.nullcontext():
             try:
-                DeltaTable(history_target)  # existence probe
+                DeltaTable(history_target, storage_options=storage_options)  # existence probe
                 history_exists = True
             except TableNotFoundError:
                 write_deltalake(
@@ -372,6 +383,7 @@ def _sink_scd4(
                     configuration=_CDF_CONFIG,
                     writer_properties=WriterProperties(),
                     commit_properties=commit_properties,
+                    storage_options=storage_options,
                 )
                 history_exists = False
         if history_exists:
@@ -381,7 +393,15 @@ def _sink_scd4(
                 mode="append",
                 writer_properties=WriterProperties(),
                 commit_properties=commit_properties,
+                storage_options=storage_options,
             )
 
     # Step 2: Upsert current state (SCD Type 1 semantics).
-    _upsert_overwrite(target, df, keys, partition_list, commit_properties=commit_properties)
+    _upsert_overwrite(
+        target,
+        df,
+        keys,
+        partition_list,
+        commit_properties=commit_properties,
+        storage_options=storage_options,
+    )
