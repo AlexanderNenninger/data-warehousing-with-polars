@@ -105,17 +105,17 @@ SCHEMA_DAILY = {
 
 def _normalize_csv(path: Path) -> None:
     """Fix known data-quality issues in the München cycling CSVs in-place."""
-    text = path.read_text(encoding="utf-8")
-    first_line = text.split("\n")[0]
-    if not first_line.startswith('""'):
-        return
+    text = path.read_bytes().decode("utf-8-sig")  # strips a leading BOM, if present
+    strip_index_col = text.split("\n", 1)[0].startswith('""')
+
     reader = csv.reader(io.StringIO(text))
-    rows = [row[1:] for row in reader if row]
+    rows = [[c.strip() for c in (row[1:] if strip_index_col else row)] for row in reader if row]
     rows[0] = [c.replace("min.temp", "min-temp").replace("max.temp", "max-temp") for c in rows[0]]
+
     out = io.StringIO()
     csv.writer(out).writerows(rows)
     path.write_text(out.getvalue(), encoding="utf-8")
-    logger.info("Normalized (stripped index column): %s", path.name)
+    logger.info("Normalized: %s", path.name)
 
 
 def _fetch_resources(year: int) -> tuple[list[dict], list[dict]]:
