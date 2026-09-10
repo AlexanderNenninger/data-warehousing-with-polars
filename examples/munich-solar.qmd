@@ -54,7 +54,7 @@ hourly = (
     price.with_columns(
         pl.col("timestamp").dt.replace_time_zone(None).cast(pl.Datetime("us")).alias("hour")
     )
-    .join(irradiance, left_on="hour", right_on="datetime_utc", how="inner")
+    .join(irradiance, left_on="hour", right_on="datetime_utc", how="left")
     .sort("hour")
     .collect()
 )
@@ -509,12 +509,18 @@ prepare for.
 ## Why timing matters — the midday price dip
 
 Germany-wide PV output depresses the day-ahead price around midday — the
-"duck curve" effect. One representative June week:
+"duck curve" effect. The window below straddles the point where measured PV
+generation runs out and only price data remains:
 
 ```{python}
 #| echo: false
-week = sim.filter(
-    (pl.col("hour") >= pl.datetime(2025, 6, 16)) & (pl.col("hour") < pl.datetime(2025, 6, 23))
+irradiance_end = hourly.filter(pl.col("ghi_kwh_per_m2").is_not_null())["hour"].max()
+
+week = hourly.filter(
+    (pl.col("hour") > irradiance_end - pl.duration(days=6))
+    & (pl.col("hour") <= irradiance_end + pl.duration(days=7))
+).with_columns(
+    (pl.col("ghi_kwh_per_m2") * CAPACITY_KWP * PERFORMANCE_RATIO).alias("generation_kwh")
 )
 
 base_week = alt.Chart(week).encode(x=alt.X("hour:T", title="Hour"))
@@ -538,6 +544,11 @@ alt.layer(gen_line, price_line).resolve_scale(y="independent").properties(
     width="container", height=280
 ).configure_view(strokeWidth=0)
 ```
+
+SMARD publishes day-ahead prices faster than DWD finalizes irradiance
+readings, so the price line commonly runs a few days past where the PV
+generation area stops — a real gap in reporting cadence between the two
+sources, not missing solar output.
 
 As printed above, generation and the spot price correlate negatively across
 the full window — solar output and price move in opposite directions often
